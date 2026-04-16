@@ -170,6 +170,10 @@ python quantize_cwformer.py --checkpoint checkpoints_full/best_model.pt --output
 
 This produces `cwformer_streaming_fp32.onnx`, `cwformer_streaming_int8.onnx`, and `mel_config.json` in the `deploy/` directory.
 
+## Authorship
+
+The code in this repository was primarily written by [Claude Code](https://claude.ai/claude-code) (Anthropic), with architecture design, domain expertise, and direction from [Harris Butler](https://github.com/parsimo2010) (parsimo2010).
+
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
