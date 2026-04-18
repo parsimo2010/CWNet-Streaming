@@ -309,10 +309,14 @@ class TrainingConfig:
     checkpoint_dir: str = "checkpoints"
     log_interval: int = 50           # batches between mid-epoch loss prints
 
-    # Beam search CER: run every N epochs on the validation set (0 = disabled)
-    # Greedy CER is always computed every epoch (fast).
-    beam_cer_interval: int = 50
-    beam_width: int = 10
+    # Streaming-mode validation: run val audio through CWFormerStreamingDecoder
+    # every N epochs and log val_cer_stream alongside val_cer_full. Drift of
+    # > ~1% absolute CER on converged in-distribution audio is a regression
+    # signal (cuDNN kernel heuristics + chunked state plumbing). 0 disables
+    # the feature; validation stays full-forward only.
+    stream_val_every_n_epochs: int = 0
+    stream_val_chunk_ms: int = 500
+    stream_val_max_cache_sec: float = 30.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -398,7 +402,6 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.num_workers = 0
         cfg.training.batch_size = 16
         cfg.training.learning_rate = 5e-4
-        cfg.training.beam_cer_interval = 5
 
     elif scenario == "clean":
         cfg.morse.min_snr_db = 15.0
@@ -422,7 +425,6 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.samples_per_epoch = 100000
         cfg.training.val_samples = 5000
         cfg.training.num_workers = 4
-        cfg.training.beam_cer_interval = 50
         # Real-world augmentations (mild -- model learns basic task first)
         cfg.morse.agc_probability = 0.2
         # qsb_probability stays off for the clean stage
@@ -467,7 +469,6 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.samples_per_epoch = 75000
         cfg.training.val_samples = 5000
         cfg.training.num_workers = 4
-        cfg.training.beam_cer_interval = 50
         # Real-world augmentations (moderate strength)
         cfg.morse.agc_probability = 0.4
         cfg.morse.agc_depth_db_max = 18.0
@@ -528,7 +529,6 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.samples_per_epoch = 50000
         cfg.training.val_samples = 5000
         cfg.training.num_workers = 4
-        cfg.training.beam_cer_interval = 50
         # Real-world augmentations (full strength for curriculum stage 3)
         cfg.morse.agc_probability = 0.5
         cfg.morse.agc_depth_db_max = 22.0

@@ -15,7 +15,7 @@ archive/
 
 # model checkpoints and training artifacts
 *.pt
-checkpoints_cwformer*/
+checkpoints_*/
 
 # pre-generated audio-based samples
 *.npz

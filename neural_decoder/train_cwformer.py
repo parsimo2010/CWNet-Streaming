@@ -52,6 +52,7 @@ from neural_decoder.cwformer import CWFormer, CWFormerConfig
 from neural_decoder.conformer import ConformerConfig
 from neural_decoder.mel_frontend import MelFrontendConfig
 from neural_decoder.dataset_audio import AudioDataset, collate_fn
+from neural_decoder.inference_cwformer import CWFormerStreamingDecoder
 
 
 # ---------------------------------------------------------------------------
@@ -60,12 +61,6 @@ from neural_decoder.dataset_audio import AudioDataset, collate_fn
 
 def greedy_decode(log_probs: torch.Tensor) -> str:
     return vocab_module.decode_ctc(log_probs, blank_idx=0, strip_trailing_space=True)
-
-
-def beam_decode(log_probs: torch.Tensor, beam_width: int = 10) -> str:
-    return vocab_module.beam_search_ctc(
-        log_probs, beam_width=beam_width, blank_idx=0, strip_trailing_space=True
-    )
 
 
 def levenshtein(a: str, b: str) -> int:
@@ -180,16 +175,36 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     use_amp: bool = False,
-    beam_width: int = 0,
+    stream_decoder: Optional[CWFormerStreamingDecoder] = None,
+    stream_max_audio_sec: Optional[float] = None,
 ) -> dict:
-    """Evaluate model on a dataset. Returns dict with loss, greedy_cer, beam_cer."""
+    """Evaluate model on a dataset.
+
+    Returns dict with loss, greedy_cer, and (when a ``stream_decoder``
+    is provided) ``stream_cer`` plus ``stream_n``.
+    The streaming path re-runs each val sample through
+    ``CWFormerStreamingDecoder`` so the reported number tracks the
+    actual deployment-time chunk-by-chunk CER. It is expected to agree
+    with ``greedy_cer`` to within ~1% absolute on converged in-
+    distribution audio; persistent drift beyond that is a regression
+    signal against the streaming state-carry code (or cuDNN kernel
+    heuristics diverging between full-sequence and short-chunk inputs).
+
+    The streaming decoder calls ``feed_audio`` + ``flush`` directly on
+    the already-generated val audio instead of ``decode_audio``: val
+    samples come from ``morse_generator``, which peak-normalises each
+    sample; re-normalising in ``decode_audio`` would scale the audio
+    away from what ``model.forward()`` sees in the same loop and
+    inflate any apparent divergence between the two metrics.
+    """
     model.eval()
     ctc_loss_fn = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
 
     total_loss = 0.0
     total_batches = 0
     all_cer_greedy = []
-    all_cer_beam = []
+    all_cer_stream: list = []
+    stream_skipped = 0
 
     with torch.no_grad():
         for audio, targets, audio_lens, target_lens, texts in loader:
@@ -208,11 +223,17 @@ def evaluate(
                     if len(idx) == 0:
                         del audio, targets, audio_lens, target_lens, log_probs, out_lens
                         continue
+                    keep_idx = idx.cpu().tolist()
                     log_probs = log_probs[:, idx, :]
                     targets = targets[idx]
                     out_lens = out_lens[idx]
                     target_lens = target_lens[idx]
-                    texts = [texts[i] for i in idx.cpu().tolist()]
+                    texts = [texts[i] for i in keep_idx]
+                    audio_lens_kept = audio_lens[idx]
+                    audio_kept = audio[idx]
+                else:
+                    audio_lens_kept = audio_lens
+                    audio_kept = audio
 
                 loss = ctc_loss_fn(log_probs, targets, out_lens, target_lens)
 
@@ -222,7 +243,21 @@ def evaluate(
             # Move to CPU for CER computation, free GPU memory
             log_probs_cpu = log_probs.cpu()
             out_lens_cpu = out_lens.cpu()
-            del audio, targets, audio_lens, target_lens, log_probs, out_lens, loss
+
+            # Per-sample audio needed for the streaming pass; stash on CPU
+            # so we can release GPU audio before streaming inference runs
+            # (streaming decoder is on the same device, but its own audio
+            # tensors will be small per-chunk transfers).
+            stream_inputs: list = []
+            if stream_decoder is not None:
+                audio_cpu = audio_kept.detach().cpu().numpy()
+                audio_lens_cpu = audio_lens_kept.detach().cpu().tolist()
+                for i, L in enumerate(audio_lens_cpu):
+                    L = int(L)
+                    stream_inputs.append(audio_cpu[i, :L])
+
+            del audio, audio_kept, targets, audio_lens, audio_lens_kept
+            del target_lens, log_probs, out_lens, loss
 
             B = log_probs_cpu.shape[1]
             for i in range(B):
@@ -233,19 +268,39 @@ def evaluate(
                 cer_g = compute_cer(hyp_greedy, texts[i])
                 all_cer_greedy.append(cer_g)
 
-                if beam_width > 0:
-                    hyp_beam = beam_decode(lp_i, beam_width)
-                    cer_b = compute_cer(hyp_beam, texts[i])
-                    all_cer_beam.append(cer_b)
-
             del log_probs_cpu, out_lens_cpu
+
+            if stream_decoder is not None:
+                sample_rate = stream_decoder.sample_rate
+                for i, audio_i in enumerate(stream_inputs):
+                    # Skip anything longer than the KV cache window so the
+                    # streaming path doesn't start trimming context the
+                    # full-forward path still has.
+                    if stream_max_audio_sec is not None:
+                        if len(audio_i) > stream_max_audio_sec * sample_rate:
+                            stream_skipped += 1
+                            continue
+                    stream_decoder.reset()
+                    stream_decoder.feed_audio(audio_i)
+                    stream_decoder.flush()
+                    hyp_stream = stream_decoder.get_full_text()
+                    cer_s = compute_cer(hyp_stream, texts[i])
+                    all_cer_stream.append(cer_s)
+                # Release accumulated log-probs from the last sample.
+                stream_decoder.reset()
+
+            del stream_inputs
 
     results = {
         "loss": total_loss / max(1, total_batches),
         "greedy_cer": float(np.mean(all_cer_greedy)) if all_cer_greedy else 1.0,
     }
-    if all_cer_beam:
-        results["beam_cer"] = float(np.mean(all_cer_beam))
+    if stream_decoder is not None:
+        results["stream_cer"] = (
+            float(np.mean(all_cer_stream)) if all_cer_stream else float("nan")
+        )
+        results["stream_n"] = len(all_cer_stream)
+        results["stream_skipped"] = stream_skipped
     return results
 
 
@@ -487,10 +542,41 @@ def train(args: argparse.Namespace) -> None:
 
     train_ds, val_ds, train_loader, val_loader = _build_dataloaders(config)
 
+    # ---- Streaming-mode val decoder ----
+    # Resolve CLI override first, then config default. 0 disables the feature
+    # (no decoder built, no per-epoch overhead).
+    stream_val_every = (
+        args.stream_val_every_n_epochs
+        if args.stream_val_every_n_epochs is not None
+        else config.training.stream_val_every_n_epochs
+    )
+    stream_chunk_ms = (
+        args.stream_val_chunk_ms
+        if args.stream_val_chunk_ms is not None
+        else config.training.stream_val_chunk_ms
+    )
+    stream_max_cache_sec = (
+        args.stream_val_max_cache_sec
+        if args.stream_val_max_cache_sec is not None
+        else config.training.stream_val_max_cache_sec
+    )
+    stream_decoder: Optional[CWFormerStreamingDecoder] = None
+    if stream_val_every > 0:
+        stream_decoder = CWFormerStreamingDecoder.from_model(
+            model=model,
+            model_cfg=model_cfg,
+            sample_rate=mel_cfg.sample_rate,
+            chunk_ms=stream_chunk_ms,
+            device=device,
+            max_cache_sec=stream_max_cache_sec,
+        )
+        print(f"Streaming-val enabled: every {stream_val_every} epoch(s), "
+              f"chunk_ms={stream_chunk_ms}, max_cache_sec={stream_max_cache_sec}")
+
     # ---- CSV log ----
     log_path = ckpt_dir / "training_log.csv"
     log_fields = ["epoch", "train_loss", "train_entropy", "val_loss",
-                  "greedy_cer", "beam_cer", "lr", "time_s"]
+                  "greedy_cer", "stream_cer", "lr", "time_s"]
     if not log_path.exists() or start_epoch == 0:
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(log_fields)
@@ -499,7 +585,6 @@ def train(args: argparse.Namespace) -> None:
     cache_dir = args.cache_dir
 
     # ---- Training loop ----
-    beam_cer_interval = 50
     reuse_str = (f", buffer_epochs={buffer_epochs}, reuse_factor={reuse_factor}"
                  if reuse_factor > 1 else "")
     print(f"\nTraining: {total_epochs} epochs, {samples_per_epoch} samples/epoch, "
@@ -539,8 +624,10 @@ def train(args: argparse.Namespace) -> None:
     epochs_in_stage = 0
     # Epochs since best_greedy_cer last improved by >= curriculum_min_delta.
     epochs_since_improvement = 0
-    # Global flag to exit the epoch loop cleanly when full-stage plateau hits.
-    training_complete = False
+    # Latches once the full stage's plateau check fires, so we do the
+    # plateau book-keeping (training_complete.txt + best_model_full.pt)
+    # exactly once but keep training to the end of the epoch budget.
+    full_plateau_fired = False
 
     epoch = start_epoch
     while epoch < total_epochs:
@@ -714,21 +801,38 @@ def train(args: argparse.Namespace) -> None:
         # ---- Validation ----
         if is_rocm:
             torch.cuda.empty_cache()
-        do_beam = (epoch + 1) % beam_cer_interval == 0 or epoch == total_epochs - 1
+        do_stream = (
+            stream_decoder is not None
+            and stream_val_every > 0
+            and ((epoch + 1) % stream_val_every == 0
+                 or epoch == total_epochs - 1)
+        )
         val_results = evaluate(
             model, val_loader, device, use_amp,
-            beam_width=10 if do_beam else 0,
+            stream_decoder=stream_decoder if do_stream else None,
+            stream_max_audio_sec=(stream_max_cache_sec if do_stream else None),
         )
 
         elapsed = time.time() - t0
         val_loss = val_results["loss"]
         greedy_cer = val_results["greedy_cer"]
-        beam_cer = val_results.get("beam_cer", -1.0)
+        stream_cer = val_results.get("stream_cer", float("nan"))
+        stream_n = val_results.get("stream_n", 0)
+        stream_skipped = val_results.get("stream_skipped", 0)
+
+        stream_str = ""
+        if do_stream and stream_n > 0:
+            stream_str = f" stream={stream_cer:.3f}"
+            diff = stream_cer - greedy_cer
+            stream_str += f" (Δ={diff:+.3f}"
+            if stream_skipped > 0:
+                stream_str += f", skipped={stream_skipped}"
+            stream_str += ")"
 
         print(f"Epoch {epoch+1:4d}/{total_epochs} | "
               f"train={avg_train_loss:.4f} val={val_loss:.4f} | "
               f"CER={greedy_cer:.3f}"
-              + (f" beam={beam_cer:.3f}" if beam_cer >= 0 else "")
+              + stream_str
               + (f" | H={avg_train_entropy:.3f}" if avg_train_entropy is not None else "")
               + f" | lr={current_lr:.2e} | {elapsed:.0f}s")
 
@@ -739,7 +843,8 @@ def train(args: argparse.Namespace) -> None:
                 f"{avg_train_loss:.6f}",
                 f"{avg_train_entropy:.6f}" if avg_train_entropy is not None else "",
                 f"{val_loss:.6f}",
-                f"{greedy_cer:.6f}", f"{beam_cer:.6f}" if beam_cer >= 0 else "",
+                f"{greedy_cer:.6f}",
+                f"{stream_cer:.6f}" if do_stream and stream_n > 0 else "",
                 f"{current_lr:.2e}", f"{elapsed:.1f}",
             ])
 
@@ -796,8 +901,17 @@ def train(args: argparse.Namespace) -> None:
             torch.save(ckpt_data, ckpt_dir / f"checkpoint_epoch{epoch+1}.pt")
 
         # ---- Auto-curriculum plateau check ----
+        # Plateau in clean/moderate advances to the next stage.
+        # Plateau in full does *not* stop training — it writes a marker
+        # + plateau checkpoint once and then training continues to the
+        # end of the epoch budget (at which point an "exhausted" marker
+        # and final checkpoint are written).
         epochs_in_stage += 1
-        if args.auto_curriculum:
+        plateau_active = args.auto_curriculum and (
+            current_scenario in ("clean", "moderate")
+            or (current_scenario == "full" and not full_plateau_fired)
+        )
+        if plateau_active:
             if improved_this_epoch:
                 epochs_since_improvement = 0
             else:
@@ -808,135 +922,163 @@ def train(args: argparse.Namespace) -> None:
                 and epochs_since_improvement >= args.curriculum_patience
             )
 
-            if plateau_hit:
-                if current_scenario in ("clean", "moderate"):
-                    # ---- Advance to the next stage ----
-                    next_scenario = CURRICULUM_ORDER[
-                        CURRICULUM_ORDER.index(current_scenario) + 1
-                    ]
-                    # Save current stage best as best_model_{stage}.pt
-                    stage_best_src = ckpt_dir / "best_model.pt"
-                    stage_best_dst = ckpt_dir / f"best_model_{current_scenario}.pt"
-                    if stage_best_src.exists():
-                        shutil.copyfile(stage_best_src, stage_best_dst)
+            if plateau_hit and current_scenario == "full":
+                # ---- Full-stage plateau: record but keep running ----
+                banner = "=" * 72
+                reason = (
+                    f"plateau in full stage: no >= "
+                    f"{args.curriculum_min_delta:.4f} CER improvement "
+                    f"in {epochs_since_improvement} epochs "
+                    f"(stage ran {epochs_in_stage} epochs, "
+                    f"min={args.curriculum_min_epochs})"
+                )
+                print(f"\n{banner}")
+                print(f"AUTO-CURRICULUM: FULL-STAGE PLATEAU (continuing)")
+                print(f"  reason: {reason}")
+                print(f"  best_greedy_cer: {best_greedy_cer:.4f}")
+                print(f"  training will continue to end of epoch budget "
+                      f"(epoch {total_epochs}).")
+                print(f"{banner}\n", flush=True)
 
-                    banner = "=" * 72
-                    reason = (
-                        f"plateau: no >= {args.curriculum_min_delta:.4f} "
-                        f"CER improvement in {epochs_since_improvement} epochs "
-                        f"(stage ran {epochs_in_stage} epochs, "
-                        f"min={args.curriculum_min_epochs})"
-                    )
-                    print(f"\n{banner}")
-                    print(f"AUTO-CURRICULUM: ADVANCING TO {next_scenario.upper()}")
-                    print(f"  from: {current_scenario} (saved "
-                          f"{stage_best_dst.name})")
-                    print(f"  reason: {reason}")
-                    print(f"  best_greedy_cer at transition: {best_greedy_cer:.4f}")
-                    print(f"{banner}\n", flush=True)
+                # Snapshot the plateau best as best_model_full.pt.
+                stage_best_src = ckpt_dir / "best_model.pt"
+                stage_best_dst = ckpt_dir / "best_model_full.pt"
+                if stage_best_src.exists():
+                    shutil.copyfile(stage_best_src, stage_best_dst)
 
-                    # Reload model weights from the just-saved stage best
-                    # so the new stage starts from the best of the prior one.
-                    if stage_best_dst.exists():
-                        sd = torch.load(stage_best_dst, map_location=device,
-                                        weights_only=False)
-                        if "model_state_dict" in sd:
-                            model.load_state_dict(sd["model_state_dict"], strict=False)
-                        else:
-                            model.load_state_dict(sd, strict=False)
-                        del sd
-
-                    # Switch scenario and rebuild config + datasets/loaders.
-                    current_scenario = next_scenario
-                    config = create_default_config(current_scenario)
-                    # Per-stage epoch cap becomes the ceiling for the new stage.
-                    stage_cap = stage_budgets[current_scenario]
-                    # Grow total_epochs so the new stage has its full budget
-                    # starting from the current epoch counter.
-                    total_epochs = (epoch + 1) + stage_cap
-                    config.training.num_epochs = total_epochs
-                    # Rebuild datasets/loaders with the new scenario's MorseConfig.
-                    train_ds, val_ds, train_loader, val_loader = _build_dataloaders(config)
-
-                    # Reset buffer state so any reuse_factor buffers start
-                    # fresh under the new scenario distribution.
-                    _buffer = []
-                    _phase = "fill"
-                    _fill_count = 0
-                    _replay_count = 0
-                    _batches_per_epoch = 0
-                    _buffer_gen = -1
-
-                    # Reset LR schedule to a fresh cosine warmup -> floor over
-                    # the remaining epochs.  Preserve optimizer momentum
-                    # buffers; just reset the per-param-group LR and rebuild
-                    # the LambdaLR so progress starts at 0 again.
-                    for pg in optimizer.param_groups:
-                        pg["lr"] = args.lr
-                        pg.pop("initial_lr", None)
-                    remaining_epochs = total_epochs - (epoch + 1)
-                    warmup_epochs = min(5, max(1, remaining_epochs // 40))
-                    lr_floor = args.lr_floor
-
-                    def lr_lambda_stage(e_in_stage: int,
-                                        _rem=remaining_epochs,
-                                        _warm=warmup_epochs,
-                                        _floor=lr_floor) -> float:
-                        if e_in_stage < _warm:
-                            return (e_in_stage + 1) / _warm
-                        progress = (e_in_stage - _warm) / max(1, _rem - _warm)
-                        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-                        return max(_floor, cosine)
-
-                    scheduler = torch.optim.lr_scheduler.LambdaLR(
-                        optimizer, lr_lambda_stage
+                with open(ckpt_dir / "training_complete.txt", "w") as f:
+                    f.write(
+                        f"scenario={current_scenario}\n"
+                        f"plateau_epoch={epoch + 1}\n"
+                        f"best_greedy_cer={best_greedy_cer:.6f}\n"
+                        f"reason={reason}\n"
                     )
 
-                    # Reset stage trackers.
-                    best_greedy_cer = float("inf")
-                    best_val_loss = float("inf")
-                    epochs_in_stage = 0
-                    epochs_since_improvement = 0
+                # Latch so plateau checks stop firing for this run.
+                full_plateau_fired = True
+            elif plateau_hit:
+                # ---- Advance to the next stage ----
+                next_scenario = CURRICULUM_ORDER[
+                    CURRICULUM_ORDER.index(current_scenario) + 1
+                ]
+                # Save current stage best as best_model_{stage}.pt
+                stage_best_src = ckpt_dir / "best_model.pt"
+                stage_best_dst = ckpt_dir / f"best_model_{current_scenario}.pt"
+                if stage_best_src.exists():
+                    shutil.copyfile(stage_best_src, stage_best_dst)
 
-                    print(f"Scenario: {current_scenario} "
-                          f"(stage budget {stage_cap} epochs, "
-                          f"total_epochs now {total_epochs})")
-                else:
-                    # ---- full scenario plateau: training is done ----
-                    banner = "=" * 72
-                    reason = (
-                        f"plateau in full stage: no >= "
-                        f"{args.curriculum_min_delta:.4f} CER improvement "
-                        f"in {epochs_since_improvement} epochs "
-                        f"(stage ran {epochs_in_stage} epochs, "
-                        f"min={args.curriculum_min_epochs})"
-                    )
-                    print(f"\n{banner}")
-                    print(f"AUTO-CURRICULUM: TRAINING COMPLETE")
-                    print(f"  final stage: {current_scenario}")
-                    print(f"  reason: {reason}")
-                    print(f"  final best_greedy_cer: {best_greedy_cer:.4f}")
-                    print(f"{banner}\n", flush=True)
+                banner = "=" * 72
+                reason = (
+                    f"plateau: no >= {args.curriculum_min_delta:.4f} "
+                    f"CER improvement in {epochs_since_improvement} epochs "
+                    f"(stage ran {epochs_in_stage} epochs, "
+                    f"min={args.curriculum_min_epochs})"
+                )
+                print(f"\n{banner}")
+                print(f"AUTO-CURRICULUM: ADVANCING TO {next_scenario.upper()}")
+                print(f"  from: {current_scenario} (saved "
+                      f"{stage_best_dst.name})")
+                print(f"  reason: {reason}")
+                print(f"  best_greedy_cer at transition: {best_greedy_cer:.4f}")
+                print(f"{banner}\n", flush=True)
 
-                    # Ensure best_model_full.pt exists as well, for symmetry.
-                    stage_best_src = ckpt_dir / "best_model.pt"
-                    stage_best_dst = ckpt_dir / f"best_model_{current_scenario}.pt"
-                    if stage_best_src.exists():
-                        shutil.copyfile(stage_best_src, stage_best_dst)
+                # Reload model weights from the just-saved stage best
+                # so the new stage starts from the best of the prior one.
+                if stage_best_dst.exists():
+                    sd = torch.load(stage_best_dst, map_location=device,
+                                    weights_only=False)
+                    if "model_state_dict" in sd:
+                        model.load_state_dict(sd["model_state_dict"], strict=False)
+                    else:
+                        model.load_state_dict(sd, strict=False)
+                    del sd
 
-                    marker_path = ckpt_dir / "training_complete.txt"
-                    with open(marker_path, "w") as f:
-                        f.write(
-                            f"scenario={current_scenario}\n"
-                            f"final_epoch={epoch + 1}\n"
-                            f"best_greedy_cer={best_greedy_cer:.6f}\n"
-                            f"reason={reason}\n"
-                        )
-                    training_complete = True
+                # Switch scenario and rebuild config + datasets/loaders.
+                current_scenario = next_scenario
+                config = create_default_config(current_scenario)
+                # Per-stage epoch cap becomes the ceiling for the new stage.
+                stage_cap = stage_budgets[current_scenario]
+                # Grow total_epochs so the new stage has its full budget
+                # starting from the current epoch counter.
+                total_epochs = (epoch + 1) + stage_cap
+                config.training.num_epochs = total_epochs
+                # Rebuild datasets/loaders with the new scenario's MorseConfig.
+                train_ds, val_ds, train_loader, val_loader = _build_dataloaders(config)
+
+                # Reset buffer state so any reuse_factor buffers start
+                # fresh under the new scenario distribution.
+                _buffer = []
+                _phase = "fill"
+                _fill_count = 0
+                _replay_count = 0
+                _batches_per_epoch = 0
+                _buffer_gen = -1
+
+                # Reset LR schedule to a fresh cosine warmup -> floor over
+                # the remaining epochs.  Preserve optimizer momentum
+                # buffers; just reset the per-param-group LR and rebuild
+                # the LambdaLR so progress starts at 0 again.
+                for pg in optimizer.param_groups:
+                    pg["lr"] = args.lr
+                    pg.pop("initial_lr", None)
+                remaining_epochs = total_epochs - (epoch + 1)
+                warmup_epochs = min(5, max(1, remaining_epochs // 40))
+                lr_floor = args.lr_floor
+
+                def lr_lambda_stage(e_in_stage: int,
+                                    _rem=remaining_epochs,
+                                    _warm=warmup_epochs,
+                                    _floor=lr_floor) -> float:
+                    if e_in_stage < _warm:
+                        return (e_in_stage + 1) / _warm
+                    progress = (e_in_stage - _warm) / max(1, _rem - _warm)
+                    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                    return max(_floor, cosine)
+
+                scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    optimizer, lr_lambda_stage
+                )
+
+                # Reset stage trackers.
+                best_greedy_cer = float("inf")
+                best_val_loss = float("inf")
+                epochs_in_stage = 0
+                epochs_since_improvement = 0
+
+                print(f"Scenario: {current_scenario} "
+                      f"(stage budget {stage_cap} epochs, "
+                      f"total_epochs now {total_epochs})")
 
         epoch += 1
-        if training_complete:
-            break
+
+    # ---- End of schedule: write exhausted marker + final checkpoint if
+    # auto-curriculum hit the full stage and the epoch budget ran out.
+    # Separate from training_complete.txt (written at full-stage plateau):
+    # "complete" = plateau fired; "exhausted" = schedule end reached.
+    if args.auto_curriculum and current_scenario == "full":
+        banner = "=" * 72
+        print(f"\n{banner}")
+        print(f"AUTO-CURRICULUM: EPOCH BUDGET EXHAUSTED")
+        print(f"  final stage: {current_scenario}")
+        print(f"  ran {epochs_in_stage} epochs in full "
+              f"(total {epoch} epochs)")
+        print(f"  final best_greedy_cer: {best_greedy_cer:.4f}")
+        print(f"  plateau fired earlier: {full_plateau_fired}")
+        print(f"{banner}\n", flush=True)
+
+        final_src = ckpt_dir / "latest_model.pt"
+        final_dst = ckpt_dir / "final_model.pt"
+        if final_src.exists():
+            shutil.copyfile(final_src, final_dst)
+
+        with open(ckpt_dir / "training_exhausted.txt", "w") as f:
+            f.write(
+                f"scenario={current_scenario}\n"
+                f"final_epoch={epoch}\n"
+                f"best_greedy_cer={best_greedy_cer:.6f}\n"
+                f"plateau_fired={full_plateau_fired}\n"
+                f"reason=full stage reached end of epoch budget\n"
+            )
 
     print(f"\nTraining complete. Best val_loss: {best_val_loss:.4f}")
 
@@ -1003,13 +1145,35 @@ def main():
                              "replay passes; cleaned up before each refill. "
                              "Example: --cache-dir /tmp/cwformer_cache")
 
+    # Streaming-mode validation pass
+    parser.add_argument("--stream-val-every-n-epochs", type=int, default=None,
+                        dest="stream_val_every_n_epochs",
+                        help="Run a streaming-inference val pass every N epochs "
+                             "and log stream_cer alongside greedy_cer. 0 disables "
+                             "(default). Streaming-val uses the same val samples "
+                             "but routes them through CWFormerStreamingDecoder so "
+                             "the logged number reflects the deployment path. "
+                             "Adds ~10-30%% to val time.")
+    parser.add_argument("--stream-val-chunk-ms", type=int, default=None,
+                        dest="stream_val_chunk_ms",
+                        help="Chunk size (ms) for streaming-val. Default 500.")
+    parser.add_argument("--stream-val-max-cache-sec", type=float, default=None,
+                        dest="stream_val_max_cache_sec",
+                        help="KV cache cap (s) for streaming-val. Default 30 "
+                             "(matches training max_audio_sec). Val samples "
+                             "longer than this are skipped so the two paths see "
+                             "the same effective context.")
+
     # Auto-curriculum progression (clean -> moderate -> full)
     parser.add_argument("--auto-curriculum", action="store_true",
                         dest="auto_curriculum",
                         help="Automatically advance through scenarios clean -> "
                              "moderate -> full on plateau. Saves best_model_<stage>.pt "
-                             "at each transition and writes training_complete.txt "
-                             "when the full stage converges.")
+                             "at each transition. In the full stage, the first "
+                             "plateau writes best_model_full.pt + "
+                             "training_complete.txt but training continues; "
+                             "when the epoch budget finishes, final_model.pt + "
+                             "training_exhausted.txt are written.")
     parser.add_argument("--curriculum-patience", type=int, default=25,
                         dest="curriculum_patience",
                         help="Auto-curriculum: epochs of no best_greedy_cer "

@@ -183,6 +183,47 @@ class CWFormerStreamingDecoder:
         # Internal state
         self.reset()
 
+    @classmethod
+    def from_model(
+        cls,
+        model: CWFormer,
+        model_cfg: CWFormerConfig,
+        sample_rate: int,
+        chunk_ms: int = 500,
+        device: Optional[torch.device] = None,
+        max_cache_sec: Optional[float] = 30.0,
+    ) -> "CWFormerStreamingDecoder":
+        """Build a decoder around an already-instantiated model.
+
+        Intended for in-training use (streaming-mode validation pass) where
+        loading from a checkpoint file is unnecessary. The passed-in model
+        is used in place — the caller must set ``model.eval()`` before
+        running validation.
+
+        ``max_cache_sec`` writes through to ``model.config.conformer.
+        max_cache_len``; this only affects ``forward_streaming`` and does
+        not touch the training-time ``forward()``.
+        """
+        self = cls.__new__(cls)
+        self.device = (
+            torch.device(device) if device is not None
+            else next(model.parameters()).device
+        )
+        self.chunk_ms = chunk_ms
+        self._model = model
+        self._model_cfg = model_cfg
+        self.sample_rate = sample_rate
+
+        if max_cache_sec is not None:
+            frames_per_sec = sample_rate // model_cfg.mel.hop_length // 2
+            model.config.conformer.max_cache_len = int(
+                max_cache_sec * frames_per_sec
+            )
+
+        self._chunk_samples = int(chunk_ms * sample_rate / 1000)
+        self.reset()
+        return self
+
     def reset(self) -> None:
         """Reset all state for a new decoding session."""
         self._audio_buffer = np.zeros(0, dtype=np.float32)
