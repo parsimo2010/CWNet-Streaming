@@ -121,7 +121,7 @@ def main():
 
     print(f"Running {n} random evaluations (full scenario, streaming greedy decode)")
     print(f"  WPM: {mc.min_wpm}-{mc.max_wpm}, SNR: {mc.min_snr_db}-{mc.max_snr_db} dB")
-    print(f"  Chunk: {args.chunk_ms}ms, Commitment: {args.commitment_frames} frames")
+    print(f"  Chunk: {args.chunk_ms}ms")
     print(f"  Output: {args.csv}")
     print()
 

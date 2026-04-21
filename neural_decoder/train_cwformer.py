@@ -4,8 +4,7 @@ train_cwformer.py — Training loop for the causal streaming CW-Former.
 
 The model uses fully causal attention (is_causal=True) and causal
 convolutions during training. No explicit mask construction is needed —
-causality is enforced internally by the model architecture. Weights are
-shape-compatible with the original bidirectional CW-Former for fine-tuning.
+causality is enforced internally by the model architecture.
 
 Usage:
     # Quick test (verify pipeline)
@@ -22,9 +21,8 @@ Usage:
     python -m neural_decoder.train_cwformer --scenario full \
         --checkpoint checkpoints_cwformer/best_model_moderate.pt
 
-    # Fine-tune from bidirectional CWNet checkpoint
-    python -m neural_decoder.train_cwformer --scenario full \
-        --checkpoint /path/to/cwnet_bidirectional/best_model.pt
+    # Auto-curriculum: clean -> moderate -> full on CER plateau
+    python -m neural_decoder.train_cwformer --scenario clean --auto-curriculum
 """
 
 from __future__ import annotations

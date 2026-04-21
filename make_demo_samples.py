@@ -3,12 +3,14 @@
 make_demo_samples.py — Produce a small set of demo WAV files for human
 listening tests.
 
-Generates four 2-minute samples under demo_samples/:
-  * demo_clean_paddle_snr25dB.wav  — paddle, 500 Hz BPF, +25 dB SNR
-  * demo_clean_paddle_snr06dB.wav  — paddle, 500 Hz BPF,  +6 dB SNR
-  * demo_clean_paddle_snr-5dB.wav  — paddle, 500 Hz BPF,  -5 dB SNR
-  * demo_challenging_straight_snr06dB.wav — straight key, +6 dB SNR,
+Generates five 200-character samples (duration depends on WPM) under demo_samples/:
+  * demo_clean_paddle_snr+25dB.wav  — paddle, 500 Hz BPF, +25 dB SNR
+  * demo_clean_paddle_snr+6dB.wav   — paddle, 500 Hz BPF,  +6 dB SNR
+  * demo_clean_paddle_snr-5dB.wav   — paddle, 500 Hz BPF,  -5 dB SNR
+  * demo_challenging_straight_snr+6dB.wav — straight key, +6 dB SNR,
        moderate jitter + drift + AGC + QSB + QRM + QRN
+  * demo_challenging_straight_snr-10dB.wav — straight key, -10 dB SNR,
+       heavy jitter + drift + AGC + deep QSB + QRN (no QRM)
 
 Each WAV has an adjacent .txt with the ground-truth text.
 
@@ -220,7 +222,7 @@ def main() -> int:
 
     print("Clean paddle, 500 Hz BPF, SNR sweep:")
     for snr in (25.0, 6.0, -5.0):
-        stem = f"demo_clean_paddle_snr{int(snr):+d}dB".replace("+", "+")
+        stem = f"demo_clean_paddle_snr{int(snr):+d}dB"
         _write_sample(out_dir, stem, _clean_paddle_cfg(snr),
                       seed=1000 + int(snr + 10))
 

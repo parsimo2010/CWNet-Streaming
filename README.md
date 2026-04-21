@@ -12,7 +12,7 @@ Audio is processed causally: each frame only sees past context, never the future
 Audio (16 kHz mono)
   → Incremental log-mel spectrogram (40 bins, 25ms/10ms)
   → Causal ConvSubsampling (2× time reduction → 50 fps)
-  → 12× Causal Conformer blocks (d=256, 4 heads, conv kernel=31)
+  → 12× Causal Conformer blocks (d=256, 4 heads, conv kernel=63)
   → CTC head → greedy decode
   → Text
 ```

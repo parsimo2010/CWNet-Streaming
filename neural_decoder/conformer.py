@@ -13,9 +13,9 @@ decoding. Each Conformer block consists of:
 Key design choices for CW:
   - RoPE instead of absolute/relative position: speed-invariant pattern
     recognition (same Morse timing pattern at any position or WPM).
-  - Conv kernel=31: captures local temporal patterns spanning ~1.2s of
-    mel frames at 40ms effective hop (after 4× subsampling). This covers
-    most multi-element Morse characters.
+  - Conv kernel=63: captures local temporal patterns spanning ~1.24 s
+    of CTC frames at 20 ms per frame (after 2× subsampling). Spans a
+    15 WPM inter-word space in a single block.
   - GLU gating in the conv module: learnable input selection for the
     depthwise conv, helping the model ignore noise frames.
 
@@ -159,20 +159,16 @@ class ConformerMHA(nn.Module):
             k_full = torch.cat([k_cached, k], dim=2)  # (B, H, T_cached+T, d_k)
             v_full = torch.cat([v_cached, v], dim=2)
 
-            # Build causal mask using tensor-valued shape ops so the ONNX
-            # graph doesn't bake trace-time T and T_cached as Python int
-            # constants. Under the legacy tracer, ``q.shape[-2]`` and
-            # ``k_full.shape[-2]`` return Python ints — any downstream
-            # ``torch.zeros(T, ...)`` / ``torch.ones(T, T)`` / ``torch.triu``
-            # freezes the mask at trace-time (T=50) shape. The chunks-1+
-            # log-prob divergence between PyTorch streaming and ONNX
-            # streaming was tracked to this.
+            # Build the causal mask using tensor-valued shape ops so the
+            # ONNX graph reads T and T_cached from the inputs at runtime
+            # instead of baking trace-time constants. ``torch._shape_as_tensor``
+            # emits ONNX Shape nodes; plain ``q.shape[-2]`` returns a Python
+            # int that would freeze the mask at the dummy-trace shape.
             #
             # Mask rule: query at row i (absolute position T_cached + i)
             # may attend to key at column j (absolute position j) iff
-            # j <= T_cached + i, i.e. disallow when (idx_k - idx_q) >
-            # T_cached. Uses ``torch._shape_as_tensor`` to force Shape
-            # ops in ONNX.
+            # j <= T_cached + i, i.e. disallow when
+            # (idx_k - idx_q) > T_cached.
             T_q_t = torch._shape_as_tensor(q)[-2].to(torch.long)
             T_k_t = torch._shape_as_tensor(k_full)[-2].to(torch.long)
             T_cached_t = T_k_t - T_q_t
@@ -268,7 +264,7 @@ class ConvolutionModule(nn.Module):
         out = F.glu(out, dim=1)     # (B, D, T)
 
         # Causal depthwise conv
-        pad_len = self.conv_kernel - 1  # 30 for kernel=31
+        pad_len = self.conv_kernel - 1
         if conv_buffer is not None:
             # Streaming: prepend buffer from previous chunk
             depthwise_input = torch.cat([conv_buffer, out], dim=2)

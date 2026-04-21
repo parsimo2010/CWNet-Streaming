@@ -169,7 +169,7 @@ class MorseConfig:
     # multiplied onto the waveform (then clipped to [-1, 1]). Teaches the
     # model to handle inputs that aren't peak-normalised, which matches
     # the real streaming inference regime where per-chunk peak varies.
-    # (0.0, 0.0) disables the augmentation (preserves legacy behaviour).
+    # (0.0, 0.0) disables the augmentation.
     input_gain_db_range: Tuple[float, float] = (0.0, 0.0)
 
     def to_dict(self) -> dict:

@@ -28,12 +28,11 @@ available; otherwise Runs 2 and 3 collapse into one):
 Exit code is driven by Run 3 (or the forced-math run if CPU was
 primary), and by any shape mismatch in any run.
 
-Shape match is required: if the streaming path's tail length differs from
-the full-forward path, that is a real bug (e.g., the `flush()` right-pad
-is missing), not a harmless artifact — so the test treats any shape
-mismatch as a failure rather than silently truncating to the shorter
-length (which is what an earlier version of this test did, hiding the
-mel tail asymmetry).
+Shape match is required: if the streaming path's tail length differs
+from the full-forward path, that is a real bug (e.g., the `flush()`
+right-pad is missing), not a harmless artifact — so the test treats any
+shape mismatch as a failure rather than silently truncating to the
+shorter length.
 
 Run:
     python tests/test_streaming_equivalence.py --checkpoint checkpoints_full_penalty/best_model.pt

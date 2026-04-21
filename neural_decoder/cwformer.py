@@ -6,7 +6,7 @@ Full pipeline:
   → MelFrontend: log-mel spectrogram (40 bins 200-1400 Hz, 25ms/10ms) + SpecAugment
   → Conv subsampling: 2× time reduction
   → Linear projection to d_model + dropout
-  → ConformerEncoder: 12 Conformer blocks (d=256, 4 heads, conv kernel=31)
+  → ConformerEncoder: 12 Conformer blocks (d=256, 4 heads, conv kernel=63)
   → Linear CTC head → log_softmax over vocabulary
 
 2× subsampling: 100 fps → 50 fps (20ms per frame). Resolves
@@ -161,11 +161,10 @@ class ConvSubsampling(nn.Module):
 
         # Carry-over for stride-2 conv: next output would read positions
         # [2*n_out, 2*n_out+1, 2*n_out+2]. Save frames from position 2*n_out
-        # onward. Size is 1 for odd padded-length, 2 for even. Saving a fixed
-        # 2 frames — as the pre-fix code did — drifts by one mel frame
-        # whenever a chunk has odd padded length (first chunk has N=49 mels
-        # with the default 500ms chunk size), misaligning every subsequent
-        # chunk's conv1 input.
+        # onward. The carry size is 1 for odd padded-length inputs and 2 for
+        # even ones — must be variable, not a fixed 2, to stay aligned across
+        # chunks (the first chunk has N=49 mels at the default 500 ms chunk
+        # size).
         L1 = x_padded.shape[2]
         if L1 < 3:  # conv1 kernel size
             # Too few frames to run conv1 — carry everything forward and
@@ -303,7 +302,7 @@ class CWFormer(nn.Module):
         d_model = cfg.d_model
         n_heads = cfg.n_heads
         d_k = d_model // n_heads
-        conv_pad = cfg.conv_kernel - 1  # 30
+        conv_pad = cfg.conv_kernel - 1
 
         kv_caches = []
         conv_buffers = []
