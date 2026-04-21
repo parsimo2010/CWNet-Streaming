@@ -4,8 +4,7 @@ train_cwformer.py — Training loop for the causal streaming CW-Former.
 
 The model uses fully causal attention (is_causal=True) and causal
 convolutions during training. No explicit mask construction is needed —
-causality is enforced internally by the model architecture. Weights are
-shape-compatible with the original bidirectional CW-Former for fine-tuning.
+causality is enforced internally by the model architecture.
 
 Usage:
     # Quick test (verify pipeline)
@@ -22,9 +21,8 @@ Usage:
     python -m neural_decoder.train_cwformer --scenario full \
         --checkpoint checkpoints_cwformer/best_model_moderate.pt
 
-    # Fine-tune from bidirectional CWNet checkpoint
-    python -m neural_decoder.train_cwformer --scenario full \
-        --checkpoint /path/to/cwnet_bidirectional/best_model.pt
+    # Auto-curriculum: clean -> moderate -> full on CER plateau
+    python -m neural_decoder.train_cwformer --scenario clean --auto-curriculum
 """
 
 from __future__ import annotations
@@ -48,6 +46,7 @@ from tqdm import tqdm
 
 import vocab as vocab_module
 from config import Config, create_default_config
+from metrics import compute_cer
 from neural_decoder.cwformer import CWFormer, CWFormerConfig
 from neural_decoder.conformer import ConformerConfig
 from neural_decoder.mel_frontend import MelFrontendConfig
@@ -56,36 +55,11 @@ from neural_decoder.inference_cwformer import CWFormerStreamingDecoder
 
 
 # ---------------------------------------------------------------------------
-# CTC decoding helpers
+# CTC decoding helper
 # ---------------------------------------------------------------------------
 
 def greedy_decode(log_probs: torch.Tensor) -> str:
     return vocab_module.decode_ctc(log_probs, blank_idx=0, strip_trailing_space=True)
-
-
-def levenshtein(a: str, b: str) -> int:
-    if len(a) < len(b):
-        return levenshtein(b, a)
-    if len(b) == 0:
-        return len(a)
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a):
-        curr = [i + 1]
-        for j, cb in enumerate(b):
-            cost = 0 if ca == cb else 1
-            curr.append(min(curr[j] + 1, prev[j + 1] + 1, prev[j] + cost))
-        prev = curr
-    return prev[-1]
-
-
-def compute_cer(hypothesis: str, reference: str) -> float:
-    # Strip boundary spaces — the model is trained with [space]+text+[space]
-    # targets but the reference text does not include boundary tokens.
-    h = hypothesis.strip().upper()
-    r = reference.strip().upper()
-    if not r:
-        return 0.0 if not h else 1.0
-    return levenshtein(h, r) / len(r)
 
 
 # ---------------------------------------------------------------------------

@@ -26,7 +26,8 @@ After import the following module-level names are available:
 CTC decoding utilities:
   decode_ctc(log_probs, blank_idx=0, strip_trailing_space=False) -> str
     Greedy argmax CTC decode for a single sample.
-    Shared by train.py and inference.py to avoid code duplication.
+    Shared by the training loop and both inference paths (PyTorch and ONNX)
+    to avoid code duplication.
 """
 
 from __future__ import annotations
@@ -161,7 +162,7 @@ def decode_ctc(
 
     Collapses repeated consecutive tokens, removes blank tokens, then maps
     indices to characters.  This is the canonical implementation shared by
-    the training loop (``train.py``) and both inference classes.
+    the training loop and both inference classes.
 
     Args:
         log_probs: ``(time, num_classes)`` log-probability tensor for one

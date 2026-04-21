@@ -1,5 +1,13 @@
 # Streaming CW-Former: Causal Streaming Conformer for Morse Decoding
 
+> **Historical document.** This is the original plan for porting the
+> bidirectional CW-Former in CWNet to a causal streaming model. It
+> captures design intent and rationale but predates subsequent
+> architectural changes (e.g. conv kernel 31→63, LayerNorm after
+> depthwise conv, extended 5–50 WPM curriculum). For the current
+> architecture and defaults, read `CLAUDE.md` and the code itself;
+> where this document disagrees with the code, the code is correct.
+
 ## Key Goals / Overarching Mission
 
 **The problem:** The current bidirectional CW-Former (~19.5M params, Conformer + CTC) achieves excellent accuracy during training (< 5% CER) but degrades in real-world streaming because it relies on decoding fixed windows of audio and stitching the results together. This forces a painful trade-off: short windows/stride = poor accuracy from stitching errors, long windows/stride = unacceptable latency (seconds of delay before new characters appear). Neither option is good for real-time use.
