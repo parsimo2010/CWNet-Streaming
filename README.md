@@ -26,47 +26,35 @@ Audio (16 kHz mono)
 
 This path uses the pre-trained ONNX model. It runs on a Raspberry Pi 5, a laptop, or anything with Python 3.10+.
 
-### 1. Install system packages
-
-On Raspberry Pi OS (Bookworm) or Debian/Ubuntu:
-
-```bash
-sudo apt update
-sudo apt install -y python3-venv python3-dev libsndfile1 libportaudio2 git curl unzip
-```
-
-### 2. Download the latest release
-
-One-liner that fetches whatever the current release zip is and unpacks it into `~/cwformer`:
+### 1. Download and unpack the latest release
 
 ```bash
 mkdir -p ~/cwformer && cd ~/cwformer
-curl -sL https://api.github.com/repos/parsimo2010/CWformer/releases/latest \
-  | grep 'browser_download_url.*cwformer-onnx.*\.zip' \
-  | head -1 \
-  | cut -d '"' -f 4 \
-  | xargs curl -L -o cwformer-latest.zip
-unzip -o cwformer-latest.zip
+curl -L -o cwformer-onnx.zip https://github.com/parsimo2010/CWformer/releases/latest/download/cwformer-onnx.zip
+unzip -o cwformer-onnx.zip
 ```
 
-### 3. Create a venv and install dependencies
+The zip always lives at the same URL, so this one-liner never changes between releases.
+
+### 2. Run the install script
 
 ```bash
-python3 -m venv ~/cwformer-env
-source ~/cwformer-env/bin/activate
-pip install --upgrade pip
-pip install -r ~/cwformer/requirements-deploy.txt
+./install.sh
 ```
 
-`requirements-deploy.txt` is included in the release zip and lists the runtime deps (`numpy`, `soundfile`, `onnxruntime`, `sounddevice`, `scipy`). No PyTorch needed.
+On Raspberry Pi OS (Bookworm) or Debian/Ubuntu this installs the required apt packages (`python3-venv`, `python3-dev`, `libsndfile1`, `libportaudio2`), creates a self-contained Python venv at `./venv`, and installs the runtime pip deps from `requirements-deploy.txt` (`numpy`, `soundfile`, `onnxruntime`, `sounddevice`, `scipy`). No PyTorch needed.
 
-### 4. Decode
+### 3. Decode
+
+Activate the venv, then pick a mode:
+
+```bash
+source venv/bin/activate
+```
 
 **Streaming from a USB sound card.** Find the device index, then start decoding:
 
 ```bash
-source ~/cwformer-env/bin/activate
-cd ~/cwformer
 python inference_onnx.py --model cwformer_streaming_int8.onnx --list-devices
 python inference_onnx.py --model cwformer_streaming_int8.onnx --device 2
 ```
@@ -180,6 +168,7 @@ CWformer/
 ├── benchmark_random_sweep.py    # Random parameter sweep benchmark
 ├── requirements-deploy.txt      # Runtime deps for ONNX inference
 ├── requirements-train.txt       # Training deps (torch + torchaudio)
+├── install.sh                   # Raspberry Pi / Debian install script (bundled in the ONNX release zip)
 │
 ├── neural_decoder/
 │   ├── cwformer.py              # CW-Former model (forward + forward_streaming)
@@ -204,8 +193,6 @@ CWformer/
 
 Open items I'd like to get to (help welcome):
 
-- **Stable release asset name.** Drop the version number from the release zip filename (use something like `cwformer-onnx.zip`) so users can download the latest release with a clean one-liner — `curl -L -o cwformer.zip https://github.com/parsimo2010/CWformer/releases/latest/download/cwformer-onnx.zip` — instead of the current `curl | grep | head | cut | xargs` pipe through the GitHub API.
-- **Simpler install script for Raspberry Pi users.** A single `install.sh` that wraps the apt packages, venv creation, release download, and requirements install into one command so end users don't have to copy multi-step shell blocks.
 - **CI.** GitHub Actions that at minimum runs `tests/test_streaming_equivalence.py` on a tiny synthetic checkpoint and verifies `tests/diagnostic/` scripts still import. A full benchmark in CI would be great eventually but needs a trained model fixture.
 
 ## Authorship

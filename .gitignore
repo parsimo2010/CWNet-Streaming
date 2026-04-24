@@ -27,6 +27,7 @@ checkpoints_*/
 # published via GitHub releases rather than committed.
 deploy/*.onnx
 deploy/*.npy
+cwformer-onnx.zip
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
