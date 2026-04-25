@@ -164,6 +164,62 @@ class MorseConfig:
     multi_op_speed_change_min: float = 0.7   # min speed multiplier at change point
     multi_op_speed_change_max: float = 1.4   # max speed multiplier at change point
 
+    # ---- Multi-segment (multiple SEQUENTIAL senders within one sample) ----
+    # Each sample is composed of N independent operator transmissions
+    # separated by silent gaps. One radio (one bandpass, one AGC, one
+    # noise floor) listening to multiple ops. Trains the streaming KV
+    # cache to release context after a gap rather than locking onto one
+    # signal -- this is the fix for the state-drift failure mode seen
+    # on long real-world recordings.
+    multi_segment_probability: float = 0.0
+    multi_segment_count_min: int = 2
+    multi_segment_count_max: int = 4
+
+    # Gap distribution (seconds). The short-gap mass forces fast cache
+    # release; long tail covers operator pauses.
+    multi_segment_gap_min: float = 0.3
+    multi_segment_gap_max: float = 5.0
+    multi_segment_gap_short_prob: float = 0.6   # prob gap <= 1.5 s
+
+    # Pitch contrast tiers (Hz) between adjacent segments. Probabilities
+    # for the four tiers; residual goes to the widest tier. Same-bin
+    # (0-10 Hz) is the hardest case -- only the fist distinguishes ops.
+    multi_segment_pitch_same_bin_prob: float = 0.35   # 0-10 Hz
+    multi_segment_pitch_near_prob: float = 0.30       # 10-50 Hz
+    multi_segment_pitch_medium_prob: float = 0.25     # 50-200 Hz
+    # remainder -> 200-500 Hz
+
+    # WPM contrast tiers between adjacent segments.
+    multi_segment_wpm_match_prob: float = 0.30   # within 1 WPM (zero-beat)
+    multi_segment_wpm_close_prob: float = 0.35   # within 5 WPM
+    multi_segment_wpm_diff_prob: float = 0.25    # within 15 WPM
+    # remainder -> wider
+
+    multi_segment_same_key_type_prob: float = 0.50
+
+    # Noise consistency: most samples represent one radio with stable
+    # band conditions; only a minority simulate user retuning mid-recording.
+    multi_segment_noise_change_prob: float = 0.15
+
+    # Per-segment relative amplitude jitter (dB below base, one-sided).
+    # Models fading / different operator power. Effective per-segment
+    # SNR varies because amplitude varies, while the noise floor stays
+    # uniform across the sample.
+    multi_segment_amplitude_jitter_db: float = 6.0
+
+    # ---- Tier 3: letter-by-letter sender alternation ----
+    # Each letter rendered with independently sampled (pitch, WPM, key,
+    # fist) drawn from a NARROW distribution centred on a session
+    # nominal value. The narrow pitch jitter forces the model to
+    # discriminate letter-by-letter operators by FIST inside the same
+    # mel bin. Use sparingly -- full stage only.
+    letter_alternation_probability: float = 0.0
+    letter_alternation_pitch_jitter_hz: float = 15.0
+    letter_alternation_gap_min: float = 0.18
+    letter_alternation_gap_max: float = 0.50
+    letter_alternation_count_min: int = 8
+    letter_alternation_count_max: int = 30
+
     # Random input gain (dB), applied AFTER peak-normalisation in
     # generate_sample(). Drawn log-uniformly in [lo, hi] dB per sample and
     # multiplied onto the waveform (then clipped to [-1, 1]). Teaches the
@@ -362,7 +418,11 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.batch_size = 512
         cfg.training.learning_rate = 1e-3
         cfg.training.num_epochs = 300
-        cfg.training.samples_per_epoch = 75000
+        # samples_per_epoch reduced from 75k -> 45k to compensate for
+        # ~1.6x longer average sample duration when multi-segment is
+        # active (40% multi-seg @ avg ~45 s vs single-seg avg ~17 s).
+        # Keeps per-epoch wall-clock similar to single-op-only training.
+        cfg.training.samples_per_epoch = 45000
         cfg.training.val_samples = 5000
         cfg.training.num_workers = 4
         # Real-world augmentations (moderate strength)
@@ -401,6 +461,15 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.multi_op_speed_change_max = 1.3
         # Input gain: ±6 dB log-uniform per sample
         cfg.morse.input_gain_db_range = (-6.0, 6.0)
+        # Multi-segment (multiple sequential senders per sample). Trains
+        # the streaming KV cache to release context after a gap rather
+        # than locking onto one signal -- the fix for state drift on
+        # long real-world sessions. Run with --max-audio-sec 90.
+        cfg.morse.multi_segment_probability = 0.40
+        cfg.morse.multi_segment_count_min = 2
+        cfg.morse.multi_segment_count_max = 3
+        # Letter alternation: full stage only.
+        cfg.morse.letter_alternation_probability = 0.0
 
     elif scenario == "full":
         cfg.morse.min_snr_db = -5.0
@@ -422,14 +491,19 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.batch_size = 512
         cfg.training.learning_rate = 1e-3
         cfg.training.num_epochs = 500
-        cfg.training.samples_per_epoch = 50000
+        # samples_per_epoch reduced from 50k -> 20k to compensate for
+        # ~2.4x longer average sample duration at full stage (75% multi-
+        # seg @ avg ~50 s vs single-seg avg ~17 s). Each gradient step
+        # now processes ~2.4x more CTC frames, so per-step loss signal
+        # is correspondingly richer.
+        cfg.training.samples_per_epoch = 20000
         cfg.training.val_samples = 5000
         cfg.training.num_workers = 4
         # Real-world augmentations (full strength for curriculum stage 3)
         cfg.morse.agc_probability = 0.5
         cfg.morse.agc_depth_db_max = 22.0
         cfg.morse.qsb_probability = 0.50
-        cfg.morse.qsb_depth_db_max = 18.0
+        cfg.morse.qsb_depth_db_max = 24.0
         # Key type: weighted toward harder key types (straight key, bug, cootie)
         cfg.morse.key_type_weights = (0.30, 0.30, 0.20, 0.20)
         # Speed drift: ±15% WPM variation within a transmission
@@ -446,10 +520,13 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.qrn_probability = 0.25
         cfg.morse.qrn_rate_max = 5.0
         cfg.morse.qrn_amplitude_max = 2.0
-        # Bandpass filter: wider filters, slightly reduced probability
-        cfg.morse.bandpass_probability = 0.60
-        cfg.morse.bandpass_bw_min = 200.0
-        cfg.morse.bandpass_bw_max = 500.0
+        # Bandpass filter: nearly-always present, wide BW range covering
+        # everything from very narrow CW filters (100 Hz) to wide
+        # SSB-style filters (700 Hz). Real receivers always have a
+        # filter, so probability stays high.
+        cfg.morse.bandpass_probability = 0.80
+        cfg.morse.bandpass_bw_min = 100.0
+        cfg.morse.bandpass_bw_max = 700.0
         cfg.morse.bandpass_order_min = 4
         cfg.morse.bandpass_order_max = 8
         # Real HF noise: full (50% of samples)
@@ -461,6 +538,18 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.multi_op_speed_change_max = 1.4
         # Input gain: ±12 dB log-uniform per sample
         cfg.morse.input_gain_db_range = (-12.0, 12.0)
+        # Multi-segment: dominant at full stage (most samples have
+        # multiple senders so the model rarely sees a single coherent
+        # signal context for the whole sample length). Run with
+        # --max-audio-sec 90.
+        cfg.morse.multi_segment_probability = 0.75
+        cfg.morse.multi_segment_count_min = 2
+        cfg.morse.multi_segment_count_max = 4
+        # Tier 3: letter-by-letter sender alternation. ~5% of multi-
+        # segment samples (i.e. ~3% overall in this stage) become
+        # letter-alternated -- narrow-pitch within a session centre to
+        # force fist-only discrimination inside the same mel bin.
+        cfg.morse.letter_alternation_probability = 0.05
 
     else:
         raise ValueError(

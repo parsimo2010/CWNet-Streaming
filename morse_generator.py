@@ -766,6 +766,116 @@ def text_to_elements(
 # Audio synthesis
 # ---------------------------------------------------------------------------
 
+def _render_clean_signal(
+    elements: List[Element],
+    sample_rate: int,
+    base_freq: float,
+    tone_drift: float,
+    rng: np.random.Generator,
+    rise_time_ms: float = 5.0,
+    qsb_depth_db: float = 0.0,
+) -> np.ndarray:
+    """Render carrier + keying envelope (+ optional QSB) -- no noise, no AGC, no peak norm.
+
+    Output peak is ~1.0 modulo QSB depth and tone-drift artifacts. This
+    is the per-sender renderer used both by single-sample synthesise_audio
+    (which then mixes noise + AGC + normalises) and by the multi-segment
+    composer (which stitches multiple of these together before adding
+    one shared noise floor).
+    """
+    msg_duration = sum(d for _, d in elements)
+    msg_samples = max(1, int(math.ceil(msg_duration * sample_rate)))
+
+    # ---- Carrier with slow sinusoidal frequency drift -------------------
+    t = np.arange(msg_samples, dtype=np.float32) / sample_rate
+    drift_rate = rng.uniform(0.05, 0.2)
+    drift_phase = rng.uniform(0.0, 2 * math.pi)
+    freq = (base_freq + tone_drift * np.sin(
+        np.float32(2 * math.pi * drift_rate) * t + np.float32(drift_phase)
+    )).astype(np.float32)
+    inst_phase = np.cumsum(np.float32(2 * math.pi / sample_rate) * freq)
+    carrier = np.sin(inst_phase).astype(np.float32)
+
+    # ---- Key envelope with soft rise/fall (prevents key clicks) ---------
+    envelope = np.zeros(msg_samples, dtype=np.float32)
+    rise_samples = max(2, int(rise_time_ms * 0.001 * sample_rate))
+    _ramp_full = (np.sin(
+        np.linspace(0.0, math.pi / 2, rise_samples, endpoint=False)
+    ) ** 2).astype(np.float32)
+
+    pos = 0
+    for is_tone, duration in elements:
+        n = int(round(duration * sample_rate))
+        end = min(pos + n, msg_samples)
+        chunk = end - pos
+        if chunk <= 0:
+            break
+        if is_tone:
+            envelope[pos:end] = 1.0
+            r = min(rise_samples, chunk // 2)
+            if r > 0:
+                ramp = _ramp_full[:r]
+                envelope[pos:pos + r] = ramp
+                envelope[end - r:end] = ramp[::-1]
+        pos = end
+        if pos >= msg_samples:
+            break
+
+    signal = carrier * envelope
+
+    # ---- QSB: slow sinusoidal signal fading -----------------------------
+    if qsb_depth_db > 0.0:
+        t_full = np.arange(msg_samples, dtype=np.float32) / sample_rate
+        signal = _apply_qsb(signal, t_full, rng, qsb_depth_db)
+
+    return signal
+
+
+def _mix_noise_and_agc(
+    signal: np.ndarray,
+    snr_db: float,
+    sample_rate: int,
+    rng: np.random.Generator,
+    agc_depth_db: float = 0.0,
+    agc_attack_ms: float = 50.0,
+    agc_release_ms: float = 400.0,
+) -> np.ndarray:
+    """Add AWGN at the requested SNR and (optionally) apply receiver AGC
+    modulation to the noise. Returns signal + noise, NOT peak-normalised.
+
+    SNR is measured against the *non-zero* portion of the signal -- i.e.
+    against the keying duty cycle rather than against gaps and silences.
+    For multi-segment audio this gives a noise floor that's consistent
+    with the per-segment rendering even though the signal contains long
+    silent stretches.
+    """
+    n = len(signal)
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
+    # Compute signal power over the keyed (non-zero) portion only. For
+    # multi-segment audio the gap silences are exact zeros, so this gives
+    # the operator's transmitted power, not power averaged over silences.
+    keyed = np.abs(signal) > 1e-6
+    if keyed.any():
+        sig_power = float(
+            np.mean(signal[keyed].astype(np.float64) ** 2)
+        )
+    else:
+        sig_power = float(np.mean(signal.astype(np.float64) ** 2))
+    noise_std = (
+        math.sqrt(sig_power / (10.0 ** (snr_db / 10.0)))
+        if sig_power > 1e-12 else 0.01
+    )
+
+    noise = rng.normal(0.0, noise_std, n).astype(np.float32)
+    if agc_depth_db > 0.0:
+        noise = _agc_noise_modulation(
+            signal, noise, sample_rate,
+            agc_attack_ms, agc_release_ms, agc_depth_db,
+        )
+    return (signal + noise).astype(np.float32)
+
+
 def synthesize_audio(
     elements: List[Element],
     sample_rate: int,
@@ -781,119 +891,483 @@ def synthesize_audio(
     qsb_depth_db: float = 0.0,
     rise_time_ms: float = 5.0,
 ) -> np.ndarray:
-    """Render Morse elements to a float32 audio waveform.
+    """Render Morse elements to a float32 audio waveform (single-sender path).
 
-    Pipeline (in order):
-      1. Carrier + key envelope → signal (message length only)
-      2. QSB: slow sinusoidal fading applied to signal
-      3. White AWGN generated for full length (message + trailing silence)
-      4. AGC: noise amplitude modulated inversely to signal envelope
-      5. Mix signal + noise
-      6. Normalise to target_amplitude
-
-    Parameters
-    ----------
-    elements : list of (is_tone, duration_sec)
-    sample_rate : int
-    base_freq : float
-        Carrier centre frequency (Hz).
-    tone_drift : float
-        Peak sinusoidal frequency drift (Hz).
-    snr_db : float
-        Target SNR measured against full-band noise (dB).
-    rng : np.random.Generator
-    trailing_silence_sec : float
-        Seconds of noise-only audio appended after the message.
-    target_amplitude : float
-        Peak amplitude of normalised output.
-    agc_depth_db : float
-        Noise suppression during peak marks (dB); 0 = disabled.
-    agc_attack_ms, agc_release_ms : float
-        AGC attack and release time constants (ms).
-    qsb_depth_db : float
-        Peak-to-peak sinusoidal fading range (dB); 0 = disabled.
-
-    Returns
-    -------
-    np.ndarray
-        Float32 waveform normalised to target_amplitude.
+    Thin wrapper around ``_render_clean_signal`` + ``_mix_noise_and_agc``
+    + peak normalisation. Existing callers see the same API/behaviour;
+    multi-segment composition uses the helpers directly so it can stitch
+    multiple clean signals before applying one shared noise floor.
     """
-    msg_duration  = sum(d for _, d in elements)
-    msg_samples   = max(1, int(math.ceil(msg_duration * sample_rate)))
-    tail_samples  = max(0, int(trailing_silence_sec * sample_rate))
-    total_samples = msg_samples + tail_samples
-
-    # ---- Carrier with slow sinusoidal frequency drift (float32) ----------
-    t = np.arange(msg_samples, dtype=np.float32) / sample_rate
-    drift_rate  = rng.uniform(0.05, 0.2)
-    drift_phase = rng.uniform(0.0, 2 * math.pi)
-    freq       = (base_freq + tone_drift * np.sin(
-        np.float32(2 * math.pi * drift_rate) * t + np.float32(drift_phase)
-    )).astype(np.float32)
-    inst_phase = np.cumsum(np.float32(2 * math.pi / sample_rate) * freq)
-    carrier    = np.sin(inst_phase).astype(np.float32)
-
-    # ---- Key envelope with soft rise/fall (prevents key clicks) ----------
-    envelope     = np.zeros(msg_samples, dtype=np.float32)
-    rise_samples = max(2, int(rise_time_ms * 0.001 * sample_rate))
-    # Precompute the full-size ramp once; slice for shorter tone elements.
-    _ramp_full = (np.sin(
-        np.linspace(0.0, math.pi / 2, rise_samples, endpoint=False)
-    ) ** 2).astype(np.float32)
-
-    pos = 0
-    for is_tone, duration in elements:
-        n     = int(round(duration * sample_rate))
-        end   = min(pos + n, msg_samples)
-        chunk = end - pos
-        if chunk <= 0:
-            break
-        if is_tone:
-            envelope[pos:end] = 1.0
-            r = min(rise_samples, chunk // 2)
-            if r > 0:
-                ramp = _ramp_full[:r]
-                envelope[pos:pos + r] = ramp
-                envelope[end - r:end] = ramp[::-1]
-        pos = end
-        if pos >= msg_samples:
-            break
-
-    signal = carrier * envelope  # already float32
-
-    # ---- Noise level from message signal power (before QSB) -------------
-    sig_power = float(np.mean(signal.astype(np.float64) ** 2))
-    noise_std = math.sqrt(sig_power / (10.0 ** (snr_db / 10.0))) if sig_power > 1e-12 else 0.01
-
-    # ---- Extend signal to full length (trailing silence = zeros) --------
+    signal = _render_clean_signal(
+        elements, sample_rate, base_freq, tone_drift, rng,
+        rise_time_ms=rise_time_ms, qsb_depth_db=qsb_depth_db,
+    )
+    tail_samples = max(0, int(trailing_silence_sec * sample_rate))
     if tail_samples > 0:
-        signal = np.concatenate([signal, np.zeros(tail_samples, dtype=np.float32)])
+        signal = np.concatenate(
+            [signal, np.zeros(tail_samples, dtype=np.float32)]
+        )
+    audio = _mix_noise_and_agc(
+        signal, snr_db, sample_rate, rng,
+        agc_depth_db=agc_depth_db,
+        agc_attack_ms=agc_attack_ms,
+        agc_release_ms=agc_release_ms,
+    )
+    peak = float(np.max(np.abs(audio)))
+    if peak > 1e-9:
+        return (audio * (target_amplitude / peak)).astype(np.float32)
+    return audio.astype(np.float32)
 
-    # ---- QSB: slow sinusoidal signal fading -----------------------------
-    if qsb_depth_db > 0.0:
-        t_full = np.arange(total_samples, dtype=np.float32) / sample_rate
-        signal = _apply_qsb(signal, t_full, rng, qsb_depth_db)
 
-    # ---- White AWGN for full audio --------------------------------------
-    noise = rng.normal(0.0, noise_std, total_samples).astype(np.float32)
+# ---------------------------------------------------------------------------
+# Multi-segment composition (multiple sequential senders per sample)
+# ---------------------------------------------------------------------------
 
-    # ---- AGC: modulate noise inversely to signal envelope ---------------
-    if agc_depth_db > 0.0:
-        noise = _agc_noise_modulation(
-            signal, noise, sample_rate, agc_attack_ms, agc_release_ms, agc_depth_db,
+def _sample_pitch_for_next_segment(
+    config: MorseConfig, rng: np.random.Generator, prev_freq: float,
+) -> float:
+    """Sample next segment's pitch with similarity bias toward `prev_freq`.
+
+    Tiered: same-bin / near / medium / wide. Same-bin (0-10 Hz) means
+    only the fist distinguishes the new operator -- the hardest and
+    most important case. Result is clamped to the configured tone-freq
+    range.
+    """
+    p1 = config.multi_segment_pitch_same_bin_prob
+    p2 = p1 + config.multi_segment_pitch_near_prob
+    p3 = p2 + config.multi_segment_pitch_medium_prob
+    r = rng.random()
+    if r < p1:
+        offset = float(rng.uniform(-10.0, 10.0))
+    elif r < p2:
+        sign = 1.0 if rng.random() < 0.5 else -1.0
+        offset = sign * float(rng.uniform(10.0, 50.0))
+    elif r < p3:
+        sign = 1.0 if rng.random() < 0.5 else -1.0
+        offset = sign * float(rng.uniform(50.0, 200.0))
+    else:
+        sign = 1.0 if rng.random() < 0.5 else -1.0
+        offset = sign * float(rng.uniform(200.0, 500.0))
+    new_freq = prev_freq + offset
+    return float(np.clip(
+        new_freq, config.tone_freq_min, config.tone_freq_max,
+    ))
+
+
+def _sample_wpm_for_next_segment(
+    config: MorseConfig, rng: np.random.Generator, prev_wpm: float,
+) -> float:
+    """Sample next segment's WPM with similarity bias toward `prev_wpm`."""
+    p1 = config.multi_segment_wpm_match_prob
+    p2 = p1 + config.multi_segment_wpm_close_prob
+    p3 = p2 + config.multi_segment_wpm_diff_prob
+    r = rng.random()
+    if r < p1:
+        offset = float(rng.uniform(-1.0, 1.0))
+    elif r < p2:
+        sign = 1.0 if rng.random() < 0.5 else -1.0
+        offset = sign * float(rng.uniform(1.0, 5.0))
+    elif r < p3:
+        sign = 1.0 if rng.random() < 0.5 else -1.0
+        offset = sign * float(rng.uniform(5.0, 15.0))
+    else:
+        # Wide: just resample from full range
+        return float(rng.uniform(config.min_wpm, config.max_wpm))
+    new_wpm = prev_wpm + offset
+    return float(np.clip(new_wpm, config.min_wpm, config.max_wpm))
+
+
+def _sample_segment_gap(
+    config: MorseConfig, rng: np.random.Generator,
+) -> float:
+    """Gap duration between segments. Short-biased so the model learns
+    to release context fast; long tail covers operator pauses."""
+    if rng.random() < config.multi_segment_gap_short_prob:
+        return float(rng.uniform(
+            config.multi_segment_gap_min,
+            min(1.5, config.multi_segment_gap_max),
+        ))
+    return float(rng.uniform(
+        max(config.multi_segment_gap_min, 1.5),
+        config.multi_segment_gap_max,
+    ))
+
+
+def _build_segment_audio(
+    config: MorseConfig,
+    rng: np.random.Generator,
+    text: str,
+    wpm: float,
+    base_freq: float,
+    key_type: str,
+    amplitude: float,
+    farnsworth_stretch: float = 1.0,
+) -> Optional[np.ndarray]:
+    """Render a single segment's clean signal at the given amplitude.
+
+    Per-segment parameters that vary independently of the inter-segment
+    similarity bias (timing knobs, jitter, QSB, ICS/IWS, etc.) are
+    sampled fresh from the config inside this function. Returns None
+    if element generation fails.
+    """
+    unit_dur = 60.0 / (wpm * 50.0)
+    if farnsworth_stretch > 1.0:
+        unit_dur = unit_dur / farnsworth_stretch
+
+    if config.timing_jitter_max > 0:
+        jitter = float(rng.uniform(
+            config.timing_jitter, config.timing_jitter_max,
+        ))
+    else:
+        jitter = config.timing_jitter
+    dah_dit_ratio = float(rng.uniform(
+        config.dah_dit_ratio_min, config.dah_dit_ratio_max,
+    ))
+    ics_factor = float(rng.uniform(
+        config.ics_factor_min, config.ics_factor_max,
+    ))
+    iws_factor = float(rng.uniform(
+        config.iws_factor_min, config.iws_factor_max,
+    ))
+    rise_time_ms = float(rng.uniform(
+        config.rise_time_ms_min, config.rise_time_ms_max,
+    ))
+    qsb_depth_db = 0.0
+    if (config.qsb_probability > 0.0
+            and rng.random() < config.qsb_probability):
+        qsb_depth_db = float(rng.uniform(
+            config.qsb_depth_db_min, config.qsb_depth_db_max,
+        ))
+    multi_op_range = None
+    if (config.multi_op_probability > 0.0
+            and rng.random() < config.multi_op_probability):
+        multi_op_range = (
+            config.multi_op_speed_change_min,
+            config.multi_op_speed_change_max,
         )
 
-    # ---- Mix ------------------------------------------------------------
-    audio = signal + noise
+    elements = text_to_elements(
+        text, unit_dur, jitter, rng,
+        dah_dit_ratio=dah_dit_ratio,
+        ics_factor=ics_factor,
+        iws_factor=iws_factor,
+        key_type=key_type,
+        speed_drift_max=config.speed_drift_max,
+        farnsworth_stretch=farnsworth_stretch,
+        multi_op_speed_range=multi_op_range,
+    )
+    if not elements:
+        return None
 
-    # ---- Normalise to target amplitude ----------------------------------
-    peak = np.max(np.abs(audio))
-    if peak > 1e-9:
-        audio = (audio * (target_amplitude / peak)).astype(np.float32)
+    clean = _render_clean_signal(
+        elements, config.sample_rate, base_freq, config.tone_drift, rng,
+        rise_time_ms=rise_time_ms, qsb_depth_db=qsb_depth_db,
+    )
+    return (clean * amplitude).astype(np.float32)
+
+
+def _compose_multi_segment(
+    config: MorseConfig,
+    rng: np.random.Generator,
+    wordlist: Optional[List[str]],
+    max_duration_sec: float,
+    letter_alternation: bool = False,
+) -> Tuple[np.ndarray, str, Dict]:
+    """Render a multi-sender clean signal with leading/trailing/gap silences.
+
+    Returns ``(clean_audio, joined_text, partial_metadata)``. The caller
+    is expected to apply a single shared noise floor + AGC + the rest
+    of the augmentation pipeline. The ``partial_metadata`` carries the
+    list of segment pitches and WPMs so the bandpass step can pick a
+    centre that covers them all.
+    """
+    sample_rate = config.sample_rate
+    base_amp = float(rng.uniform(
+        config.signal_amplitude_min, config.signal_amplitude_max,
+    ))
+    amp_jitter_db = config.multi_segment_amplitude_jitter_db
+
+    if letter_alternation:
+        n_segments = int(rng.integers(
+            config.letter_alternation_count_min,
+            config.letter_alternation_count_max + 1,
+        ))
+        gap_lo = config.letter_alternation_gap_min
+        gap_hi = config.letter_alternation_gap_max
+        gaps = [float(rng.uniform(gap_lo, gap_hi))
+                for _ in range(n_segments - 1)]
+        # Letter-alternation pitch: tight band around a session centre
+        session_pitch = float(rng.uniform(
+            config.tone_freq_min, config.tone_freq_max,
+        ))
+        pitch_jitter = config.letter_alternation_pitch_jitter_hz
     else:
-        audio = audio.astype(np.float32)
+        n_segments = int(rng.integers(
+            config.multi_segment_count_min,
+            config.multi_segment_count_max + 1,
+        ))
+        gaps = [_sample_segment_gap(config, rng)
+                for _ in range(n_segments - 1)]
+        session_pitch = None
+        pitch_jitter = None
 
-    return audio
+    leading_sec = float(rng.uniform(0.5, 1.5))
+    trailing_sec = float(rng.uniform(0.5, 1.5))
+    silence_total = leading_sec + trailing_sec + sum(gaps)
+    seg_budget = max_duration_sec - silence_total
+    if seg_budget < 1.5 * n_segments:
+        # Not enough room: shrink gaps proportionally, then segments.
+        # In the worst case, fall back to a single segment.
+        gap_total = sum(gaps)
+        if gap_total > 0:
+            shrink = max(
+                0.0,
+                (max_duration_sec - leading_sec - trailing_sec
+                 - 1.5 * n_segments) / gap_total
+            )
+            gaps = [g * shrink for g in gaps]
+            silence_total = leading_sec + trailing_sec + sum(gaps)
+            seg_budget = max_duration_sec - silence_total
+        if seg_budget < 1.5 * n_segments:
+            n_segments = max(1, int(seg_budget / 1.5))
+            gaps = gaps[:max(0, n_segments - 1)]
+    per_seg_dur = max(1.0, seg_budget / max(n_segments, 1))
+
+    # Build per-segment params with similarity bias on adjacent pairs.
+    seg_specs = []
+    prev_wpm = None
+    prev_freq = None
+    prev_key = None
+    for i in range(n_segments):
+        if letter_alternation:
+            wpm = float(rng.uniform(config.min_wpm, config.max_wpm))
+            base_freq = float(np.clip(
+                session_pitch + rng.uniform(-pitch_jitter, pitch_jitter),
+                config.tone_freq_min, config.tone_freq_max,
+            ))
+            key_type = _select_key_type(config.key_type_weights, rng)
+            target_chars = 1
+        else:
+            if prev_wpm is None:
+                wpm = float(rng.uniform(config.min_wpm, config.max_wpm))
+                base_freq = float(rng.uniform(
+                    config.tone_freq_min, config.tone_freq_max,
+                ))
+                key_type = _select_key_type(config.key_type_weights, rng)
+            else:
+                wpm = _sample_wpm_for_next_segment(config, rng, prev_wpm)
+                base_freq = _sample_pitch_for_next_segment(
+                    config, rng, prev_freq,
+                )
+                if rng.random() < config.multi_segment_same_key_type_prob:
+                    key_type = prev_key
+                else:
+                    key_type = _select_key_type(
+                        config.key_type_weights, rng,
+                    )
+            target_chars = max(3, int(per_seg_dur * wpm / 10.0 * 0.75))
+
+        # Farnsworth: per-segment decision (operator-specific habit)
+        farnsworth_stretch = 1.0
+        if (config.farnsworth_probability > 0.0
+                and rng.random() < config.farnsworth_probability):
+            farnsworth_stretch = float(rng.uniform(
+                config.farnsworth_char_speed_min,
+                config.farnsworth_char_speed_max,
+            ))
+
+        # Per-segment amplitude (dB below base, one-sided, so each
+        # segment is equal-or-quieter than nominal -- mimics fading).
+        amp_offset_db = float(rng.uniform(-amp_jitter_db, 0.0))
+        amplitude = base_amp * (10.0 ** (amp_offset_db / 20.0))
+
+        if letter_alternation:
+            # Choose a single random alphanumeric character.
+            text = chr(int(rng.integers(ord("A"), ord("Z") + 1)))
+        else:
+            text = generate_text(
+                rng,
+                min_chars=min(8, target_chars),
+                max_chars=target_chars,
+                wordlist=wordlist,
+            )
+
+        seg_specs.append({
+            "text": text, "wpm": wpm, "base_freq": base_freq,
+            "key_type": key_type, "amplitude": amplitude,
+            "farnsworth_stretch": farnsworth_stretch,
+        })
+        prev_wpm, prev_freq, prev_key = wpm, base_freq, key_type
+
+    # Render and stitch.
+    chunks: List[np.ndarray] = []
+    text_parts: List[str] = []
+    chunks.append(np.zeros(int(leading_sec * sample_rate), dtype=np.float32))
+    rendered_specs = []
+    for i, spec in enumerate(seg_specs):
+        seg_audio = _build_segment_audio(
+            config, rng,
+            text=spec["text"], wpm=spec["wpm"],
+            base_freq=spec["base_freq"], key_type=spec["key_type"],
+            amplitude=spec["amplitude"],
+            farnsworth_stretch=spec["farnsworth_stretch"],
+        )
+        if seg_audio is None or len(seg_audio) == 0:
+            continue
+        chunks.append(seg_audio)
+        text_parts.append(spec["text"])
+        rendered_specs.append(spec)
+        if i < len(gaps) and gaps[i] > 0:
+            chunks.append(np.zeros(
+                int(gaps[i] * sample_rate), dtype=np.float32,
+            ))
+    chunks.append(np.zeros(int(trailing_sec * sample_rate), dtype=np.float32))
+
+    if not text_parts:
+        raise ValueError("multi-segment composition produced no audio")
+
+    clean_audio = np.concatenate(chunks).astype(np.float32)
+    joined_text = " ".join(text_parts)
+
+    metadata: Dict = {
+        "multi_segment": True,
+        "letter_alternation": letter_alternation,
+        "n_segments": len(rendered_specs),
+        "segment_pitches": [s["base_freq"] for s in rendered_specs],
+        "segment_wpms": [s["wpm"] for s in rendered_specs],
+        "segment_key_types": [s["key_type"] for s in rendered_specs],
+        "leading_silence_sec": leading_sec,
+        "trailing_silence_sec": trailing_sec,
+        "gap_durations_sec": gaps[:len(rendered_specs) - 1],
+        "target_amplitude": base_amp,
+    }
+    return clean_audio, joined_text, metadata
+
+
+# ---------------------------------------------------------------------------
+# Shared post-processing pipeline (QRM / QRN / HF noise / bandpass / norm / gain)
+# ---------------------------------------------------------------------------
+
+def _apply_post_processing(
+    audio_f32: np.ndarray,
+    text: str,
+    config: MorseConfig,
+    rng: np.random.Generator,
+    *,
+    base_freq: float,
+    noise_std: float,
+    target_amplitude: float,
+    bandpass_bw_floor: float = 0.0,
+    metadata: Dict,
+) -> Tuple[np.ndarray, str, Dict]:
+    """Apply the receiver-side augmentation stack and finalise the sample.
+
+    Used by both the single-sender and multi-segment paths so they
+    share identical QRM / QRN / HF-noise / bandpass / peak-normalise /
+    input-gain handling. ``bandpass_bw_floor`` lets the multi-segment
+    path force a minimum bandwidth wide enough to encompass the spread
+    between the rendered segment pitches (the operator's "widen filter
+    to keep both signals in the passband" behaviour).
+    """
+    # ---- QRM: interfering CW signals -----------------------------------
+    has_qrm = False
+    qrm_count = 0
+    if (config.qrm_probability > 0.0
+            and rng.random() < config.qrm_probability):
+        qrm_count = int(rng.integers(
+            config.qrm_count_min, config.qrm_count_max + 1,
+        ))
+        audio_f32 = _apply_qrm(
+            audio_f32, config.sample_rate, rng,
+            n_interferers=qrm_count,
+            base_freq=base_freq,
+            freq_offset_min=config.qrm_freq_offset_min,
+            freq_offset_max=config.qrm_freq_offset_max,
+            amplitude_min=config.qrm_amplitude_min,
+            amplitude_max=config.qrm_amplitude_max,
+            duration_sec=len(audio_f32) / config.sample_rate,
+        )
+        has_qrm = True
+
+    # ---- QRN: impulsive atmospheric noise ------------------------------
+    has_qrn = False
+    if (config.qrn_probability > 0.0
+            and rng.random() < config.qrn_probability):
+        qrn_rate = float(rng.uniform(
+            config.qrn_rate_min, config.qrn_rate_max,
+        ))
+        sig_rms = float(np.sqrt(
+            np.mean(audio_f32.astype(np.float64) ** 2),
+        ))
+        audio_f32 = _apply_qrn(
+            audio_f32, config.sample_rate, rng,
+            rate=qrn_rate,
+            duration_ms_min=config.qrn_duration_ms_min,
+            duration_ms_max=config.qrn_duration_ms_max,
+            amplitude_min=config.qrn_amplitude_min,
+            amplitude_max=config.qrn_amplitude_max,
+            signal_rms=sig_rms,
+        )
+        has_qrn = True
+
+    # ---- Real HF noise -------------------------------------------------
+    has_hf_noise = False
+    if (config.hf_noise_probability > 0.0
+            and rng.random() < config.hf_noise_probability):
+        hf_seg = _get_hf_noise_segment(
+            config.hf_noise_dir, len(audio_f32), rng, config.sample_rate,
+        )
+        if hf_seg is not None:
+            hf_rms = float(np.sqrt(
+                np.mean(hf_seg.astype(np.float64) ** 2),
+            ))
+            if hf_rms > 1e-9:
+                hf_seg = hf_seg * (noise_std / hf_rms)
+            audio_f32 = audio_f32 + config.hf_noise_mix_ratio * hf_seg
+            has_hf_noise = True
+
+    # ---- Bandpass ------------------------------------------------------
+    has_bandpass = False
+    bandpass_bw = 0.0
+    if (config.bandpass_probability > 0.0
+            and rng.random() < config.bandpass_probability):
+        bandpass_bw = float(rng.uniform(
+            config.bandpass_bw_min, config.bandpass_bw_max,
+        ))
+        if bandpass_bw_floor > 0.0:
+            bandpass_bw = max(bandpass_bw, bandpass_bw_floor)
+        bandpass_order = int(rng.integers(
+            config.bandpass_order_min, config.bandpass_order_max + 1,
+        ))
+        audio_f32 = _apply_bandpass(
+            audio_f32, config.sample_rate, base_freq, bandpass_bw,
+            order=bandpass_order,
+        )
+        has_bandpass = True
+
+    # ---- Final peak normalisation --------------------------------------
+    peak = float(np.max(np.abs(audio_f32)))
+    if peak > 1e-9:
+        audio_f32 = (audio_f32 * (target_amplitude / peak)).astype(np.float32)
+
+    # ---- Random input gain (post-norm) ---------------------------------
+    lo, hi = config.input_gain_db_range
+    if lo != 0.0 or hi != 0.0:
+        gain_db = rng.uniform(lo, hi)
+        gain_lin = 10.0 ** (gain_db / 20.0)
+        audio_f32 = (audio_f32 * gain_lin).astype(np.float32)
+        np.clip(audio_f32, -1.0, 1.0, out=audio_f32)
+
+    metadata.update({
+        "duration_sec": len(audio_f32) / config.sample_rate,
+        "qrm": has_qrm,
+        "qrm_count": qrm_count,
+        "qrn": has_qrn,
+        "hf_noise": has_hf_noise,
+        "bandpass": has_bandpass,
+        "bandpass_bw": bandpass_bw,
+    })
+    return audio_f32, text, metadata
 
 
 # ---------------------------------------------------------------------------
@@ -934,6 +1408,111 @@ def generate_sample(
     """
     if rng is None:
         rng = np.random.default_rng()
+
+    # ---- Multi-segment dispatch -----------------------------------------
+    # When enabled, ignore the (text, wpm) caller hint and compose the
+    # sample from multiple independently-sampled sender segments. The
+    # rest of the pipeline (QRM, QRN, HF noise, bandpass, peak norm,
+    # input gain) runs unchanged on the composed audio.
+    use_multi_segment = (
+        config.multi_segment_probability > 0.0
+        and rng.random() < config.multi_segment_probability
+        and (max_duration_sec is None or max_duration_sec >= 8.0)
+    )
+    if use_multi_segment:
+        # Decide letter-alternation (Tier 3) vs sequential-segment (Tier 1).
+        letter_alt = (
+            config.letter_alternation_probability > 0.0
+            and rng.random() < config.letter_alternation_probability
+        )
+        try:
+            clean_audio, ms_text, ms_meta = _compose_multi_segment(
+                config, rng, wordlist,
+                max_duration_sec=(max_duration_sec or 90.0),
+                letter_alternation=letter_alt,
+            )
+        except ValueError:
+            use_multi_segment = False
+
+    if use_multi_segment:
+        # Whole-sample receiver-side decisions.
+        snr_db = float(rng.uniform(config.min_snr_db, config.max_snr_db))
+        agc_depth_db = 0.0
+        if (config.agc_probability > 0.0
+                and rng.random() < config.agc_probability):
+            agc_depth_db = float(rng.uniform(
+                config.agc_depth_db_min, config.agc_depth_db_max,
+            ))
+        target_amplitude = ms_meta["target_amplitude"]
+        # Bandpass centre = mean of segment carriers. The post-step
+        # bandpass is widened (via bandpass_bw_floor) to encompass the
+        # segment pitch spread -- the operator's "widen filter to keep
+        # both signals in the passband" behaviour.
+        seg_freqs = ms_meta["segment_pitches"]
+        base_freq = (
+            float(np.mean(seg_freqs)) if seg_freqs
+            else float(rng.uniform(
+                config.tone_freq_min, config.tone_freq_max,
+            ))
+        )
+        seg_pitch_spread = (
+            (max(seg_freqs) - min(seg_freqs)) if seg_freqs else 0.0
+        )
+        # Mix one shared noise floor + AGC across the whole sample.
+        audio_f32 = _mix_noise_and_agc(
+            clean_audio, snr_db, config.sample_rate, rng,
+            agc_depth_db=agc_depth_db,
+            agc_attack_ms=config.agc_attack_ms,
+            agc_release_ms=config.agc_release_ms,
+        )
+        # noise_std for HF-noise scaling, matching the single-sender path.
+        sig_power = 0.5 * target_amplitude ** 2
+        noise_std = (
+            math.sqrt(sig_power / (10.0 ** (snr_db / 10.0)))
+            if sig_power > 1e-12 else 0.01
+        )
+        wpm_meta = (
+            float(np.mean(ms_meta["segment_wpms"]))
+            if ms_meta["segment_wpms"]
+            else float(rng.uniform(config.min_wpm, config.max_wpm))
+        )
+        partial_meta: Dict = {
+            "wpm": wpm_meta,
+            "snr_db": snr_db,
+            "base_frequency_hz": base_freq,
+            "frequency_drift_hz": config.tone_drift,
+            "target_amplitude": target_amplitude,
+            "agc_depth_db": agc_depth_db,
+            "qsb_depth_db": 0.0,            # per-segment, not whole-sample
+            "leading_silence_sec": ms_meta["leading_silence_sec"],
+            "trailing_silence_sec": ms_meta["trailing_silence_sec"],
+            "timing_jitter": 0.0,
+            "dah_dit_ratio": 0.0,
+            "ics_factor": 0.0,
+            "iws_factor": 0.0,
+            "key_type": "multi",
+            "farnsworth_stretch": 1.0,
+            "multi_op": False,
+            "multi_segment": True,
+            "letter_alternation": ms_meta["letter_alternation"],
+            "n_segments": ms_meta["n_segments"],
+            "segment_pitches": ms_meta["segment_pitches"],
+            "segment_wpms": ms_meta["segment_wpms"],
+            "segment_key_types": ms_meta["segment_key_types"],
+            "seg_pitch_spread": seg_pitch_spread,
+        }
+        # Force bandpass to encompass all segment carriers (50 Hz margin
+        # per side). User behaviour: widen filter to keep both signals in
+        # the passband.
+        bw_floor = seg_pitch_spread + 100.0 if seg_pitch_spread > 0.0 else 0.0
+        return _apply_post_processing(
+            audio_f32, ms_text, config, rng,
+            base_freq=base_freq,
+            noise_std=noise_std,
+            target_amplitude=target_amplitude,
+            bandpass_bw_floor=bw_floor,
+            metadata=partial_meta,
+        )
 
     # ---- WPM ------------------------------------------------------------
     if wpm is None:
@@ -1073,89 +1652,11 @@ def generate_sample(
     leading_noise = rng.normal(0.0, noise_std, leading_samples).astype(np.float32)
     audio_f32 = np.concatenate([leading_noise, audio_f32])
 
-    # ---- QRM: interfering CW signals ------------------------------------
-    has_qrm = False
-    qrm_count = 0
-    if config.qrm_probability > 0.0 and rng.random() < config.qrm_probability:
-        qrm_count = int(rng.integers(config.qrm_count_min, config.qrm_count_max + 1))
-        audio_f32 = _apply_qrm(
-            audio_f32, config.sample_rate, rng,
-            n_interferers=qrm_count,
-            base_freq=base_freq,
-            freq_offset_min=config.qrm_freq_offset_min,
-            freq_offset_max=config.qrm_freq_offset_max,
-            amplitude_min=config.qrm_amplitude_min,
-            amplitude_max=config.qrm_amplitude_max,
-            duration_sec=len(audio_f32) / config.sample_rate,
-        )
-        has_qrm = True
-
-    # ---- QRN: impulsive atmospheric noise --------------------------------
-    has_qrn = False
-    if config.qrn_probability > 0.0 and rng.random() < config.qrn_probability:
-        qrn_rate = float(rng.uniform(config.qrn_rate_min, config.qrn_rate_max))
-        sig_rms = float(np.sqrt(np.mean(audio_f32.astype(np.float64) ** 2)))
-        audio_f32 = _apply_qrn(
-            audio_f32, config.sample_rate, rng,
-            rate=qrn_rate,
-            duration_ms_min=config.qrn_duration_ms_min,
-            duration_ms_max=config.qrn_duration_ms_max,
-            amplitude_min=config.qrn_amplitude_min,
-            amplitude_max=config.qrn_amplitude_max,
-            signal_rms=sig_rms,
-        )
-        has_qrn = True
-
-    # ---- Real HF noise: mix with existing audio -------------------------
-    has_hf_noise = False
-    if config.hf_noise_probability > 0.0 and rng.random() < config.hf_noise_probability:
-        hf_seg = _get_hf_noise_segment(
-            config.hf_noise_dir, len(audio_f32), rng, config.sample_rate,
-        )
-        if hf_seg is not None:
-            # Scale HF noise to match the existing noise level, then mix
-            hf_rms = float(np.sqrt(np.mean(hf_seg.astype(np.float64) ** 2)))
-            if hf_rms > 1e-9:
-                hf_seg = hf_seg * (noise_std / hf_rms)
-            mix = config.hf_noise_mix_ratio
-            # Replace fraction of existing audio noise with HF noise
-            audio_f32 = audio_f32 + mix * hf_seg
-            has_hf_noise = True
-
-    # ---- Bandpass filter: simulate CW receiver filter --------------------
-    has_bandpass = False
-    bandpass_bw = 0.0
-    if config.bandpass_probability > 0.0 and rng.random() < config.bandpass_probability:
-        bandpass_bw = float(rng.uniform(config.bandpass_bw_min, config.bandpass_bw_max))
-        bandpass_order = int(rng.integers(config.bandpass_order_min, config.bandpass_order_max + 1))
-        audio_f32 = _apply_bandpass(
-            audio_f32, config.sample_rate, base_freq, bandpass_bw,
-            order=bandpass_order,
-        )
-        has_bandpass = True
-
-    # ---- Final normalisation after all augmentations --------------------
-    peak = float(np.max(np.abs(audio_f32)))
-    if peak > 1e-9:
-        audio_f32 = (audio_f32 * (target_amplitude / peak)).astype(np.float32)
-
-    # ---- Random input gain (post-normalisation) -------------------------
-    # Simulates non-peak-normalised input at inference time. Drawn
-    # log-uniformly in dB, applied as a linear gain, then clipped to the
-    # valid float32 audio range. Disabled by default ((0.0, 0.0)).
-    lo, hi = config.input_gain_db_range
-    if lo != 0.0 or hi != 0.0:
-        gain_db = rng.uniform(lo, hi)
-        gain_lin = 10.0 ** (gain_db / 20.0)
-        audio_f32 = (audio_f32 * gain_lin).astype(np.float32)
-        np.clip(audio_f32, -1.0, 1.0, out=audio_f32)
-
-    metadata: Dict = {
+    partial_meta: Dict = {
         "wpm": wpm,
         "snr_db": snr_db,
         "base_frequency_hz": base_freq,
         "frequency_drift_hz": config.tone_drift,
-        "duration_sec": len(audio_f32) / config.sample_rate,
         "timing_jitter": jitter,
         "dah_dit_ratio": dah_dit_ratio,
         "ics_factor": ics_factor,
@@ -1167,15 +1668,16 @@ def generate_sample(
         "leading_silence_sec": leading_sec,
         "trailing_silence_sec": trailing_sec,
         "farnsworth_stretch": farnsworth_stretch,
-        "qrm": has_qrm,
-        "qrm_count": qrm_count,
-        "qrn": has_qrn,
-        "hf_noise": has_hf_noise,
-        "bandpass": has_bandpass,
-        "bandpass_bw": bandpass_bw,
         "multi_op": multi_op_range is not None,
+        "multi_segment": False,
     }
-    return audio_f32, text, metadata
+    return _apply_post_processing(
+        audio_f32, text, config, rng,
+        base_freq=base_freq,
+        noise_std=noise_std,
+        target_amplitude=target_amplitude,
+        metadata=partial_meta,
+    )
 
 
 

@@ -103,34 +103,37 @@ pip install -r requirements-train.txt
 
 ### 2. Train through the curriculum
 
-Training uses synthetic Morse audio generated on the fly — no dataset download is needed. Training follows a three-stage curriculum. Each stage adds progressively harder conditions (lower SNR, wider WPM range, more augmentations). You may want to stop early on the clean and moderate stages once validation loss plateaus — additional epochs past that point won't help.
+Training uses synthetic Morse audio generated on the fly — no dataset download is needed. The three-stage curriculum adds progressively harder conditions (lower SNR, wider WPM range, more augmentations). You may want to stop early on the clean and moderate stages once validation loss plateaus.
 
-**Stage 1 — Clean** (high SNR, moderate speeds):
+**Multi-fist training** (moderate / full stages). Each sample is composed of 1–4 sequential operator segments separated by silent gaps, with one shared noise floor / AGC / bandpass (one radio listening to multiple ops). Adjacent segments are deliberately biased toward similarity so the model learns to discriminate operators by their fist alone — 35% of the time the next sender's pitch falls inside the same mel bin (0–10 Hz contrast), 30% of the time their WPM matches within 1, and 50% of the time they use the same key type. The gap between segments is short-biased so the model learns to release context fast. This directly attacks the streaming state-drift failure mode where the KV cache locks onto one signal and ignores subsequent operators on the same band. Moderate runs at 40% multi-segment; full ramps to 60% plus a small dose (5%) of letter-by-letter alternation inside the same mel bin. Clean stays single-operator.
+
+Because moderate and full samples can run up to 90 seconds (multiple senders + gaps), pass `--max-audio-sec 90` on those stages.
+
+**Recommended: one auto-curriculum command** that walks all three stages, advancing on CER plateau:
 
 ```bash
-python -m neural_decoder.train_cwformer --scenario clean --ckpt-dir checkpoints_clean
+python -m neural_decoder.train_cwformer --scenario clean --auto-curriculum \
+  --max-audio-sec 90 --ckpt-dir checkpoints_curriculum
 ```
 
-**Stage 2 — Moderate** (medium SNR, timing variance, QRM):
+This is the single command for a complete run. Total budget defaults to 650 epochs split 25 / 30 / 45% across clean / moderate / full; each stage exits early on CER plateau and saves `best_model_<stage>.pt` at the transition. Final outputs are `best_model.pt` (best CER overall) and `best_model_full.pt` (full-stage plateau snapshot).
+
+**Manual stage-by-stage** (if you want full control or to resume from a specific stage):
 
 ```bash
+# Stage 1 — clean (high SNR, moderate speeds, single-operator)
+python -m neural_decoder.train_cwformer --scenario clean \
+  --ckpt-dir checkpoints_clean
+
+# Stage 2 — moderate (lower SNR, timing variance, QRM, 40% multi-segment)
 python -m neural_decoder.train_cwformer --scenario moderate \
   --checkpoint checkpoints_clean/best_model.pt \
-  --ckpt-dir checkpoints_moderate
-```
+  --max-audio-sec 90 --ckpt-dir checkpoints_moderate
 
-**Stage 3 — Full** (low SNR, all augmentations, all key types):
-
-```bash
+# Stage 3 — full (all augmentations, 60% multi-segment, 5% letter-alt)
 python -m neural_decoder.train_cwformer --scenario full \
   --checkpoint checkpoints_moderate/best_model.pt \
-  --ckpt-dir checkpoints_full
-```
-
-You can also let the training loop advance through the stages automatically on CER plateau:
-
-```bash
-python -m neural_decoder.train_cwformer --scenario clean --auto-curriculum
+  --max-audio-sec 90 --ckpt-dir checkpoints_full
 ```
 
 ### 3. Export to ONNX for deployment

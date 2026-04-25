@@ -121,10 +121,30 @@ normalized recordings at inference time.
 | Stage | SNR | WPM | AGC | QSB | Key Types (S/B/P/C) | Notable Augmentations |
 |-------|-----|-----|-----|-----|---------------------|-----------------------|
 | clean    | 15–40 dB  | 5–50 | 20% | 0%  | 20/20/60/0   | 10% Farnsworth, 50% bandpass, 15% HF noise |
-| moderate | 5–35 dB   | 5–50 | 40% | 25% | 25/25/35/15  | 20% Farnsworth, 15% QRM, 15% QRN, 60% bandpass, 30% HF noise, ±6 dB input gain |
-| full     | −5–30 dB  | 5–50 | 50% | 50% | 30/30/20/20  | 25% Farnsworth, 30% QRM, 25% QRN, 60% bandpass, 50% HF noise, 15% multi-op, ±12 dB input gain |
+| moderate | 5–35 dB   | 5–50 | 40% | 25% | 25/25/35/15  | 20% Farnsworth, 15% QRM, 15% QRN, 60% bandpass, 30% HF noise, ±6 dB input gain, **40% multi-segment** |
+| full     | −5–30 dB  | 5–50 | 50% | 50% (24 dB) | 30/30/20/20  | 25% Farnsworth, 30% QRM, 25% QRN, 80% bandpass (100–700 Hz), 50% HF noise, 15% multi-op, ±12 dB input gain, **75% multi-segment, 5% letter-alt** |
 
 See `create_default_config()` in `config.py` for exact per-stage values.
+
+**Multi-segment** (moderate/full): each sample composes 2–4 sequential
+operator segments separated by silent gaps, with a single shared noise
+floor / AGC / bandpass (one radio listening to multiple ops). Trains
+the streaming KV cache to release context after a gap rather than
+locking onto one signal — directly attacks the state-drift failure
+mode that drops 60%+ of letters on long real-world recordings.
+Adjacent segments are **biased toward similarity**: 35% same-mel-bin
+pitch (0–10 Hz), 30% near (10–50 Hz), 25% medium (50–200 Hz), 10%
+wide; WPM tiers 30/35/25/10% match/close/diff/wide; 50% same key type.
+The same-bin + matched-WPM + same-key case forces fist-only
+discrimination with the gap as the sole context-release cue. Gap
+distribution is short-biased (60% under 1.5 s) to teach fast cache
+release. **Run moderate/full with `--max-audio-sec 90`** so segments
++ gaps fit.
+
+**Letter alternation** (Tier 3, full only): 5% of multi-segment samples
+render each letter as a separate "operator" with ±15 Hz pitch jitter
+around a session centre and 0.18–0.5 s inter-letter gaps. Forces
+letter-by-letter fist discrimination inside the same mel bin.
 
 ---
 

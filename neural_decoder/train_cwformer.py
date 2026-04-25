@@ -504,13 +504,23 @@ def train(args: argparse.Namespace) -> None:
         train_loader is None when reuse_factor > 1 (the buffer path owns its
         own loader inside the epoch body).
         """
+        # Auto-clamp max_audio_sec to 30 s for stages with multi-segment
+        # disabled. At low WPM, --max-audio-sec 90 lets the dataset
+        # produce 60-90 s single-operator samples, which inflates batch
+        # padding and pays the O(T^2) attention cost for nothing -- the
+        # signal is single-operator, 30 s is plenty of room. Stages with
+        # multi-segment enabled use the full --max-audio-sec budget so
+        # the segment-plus-gap chain fits.
+        effective_max_audio_sec = args.max_audio_sec
+        if cfg.morse.multi_segment_probability <= 0.0:
+            effective_max_audio_sec = min(args.max_audio_sec, 30.0)
         _train_ds = AudioDataset(
             cfg, epoch_size=samples_per_epoch, seed=None,
-            qso_text_ratio=0.5, max_audio_sec=args.max_audio_sec,
+            qso_text_ratio=0.5, max_audio_sec=effective_max_audio_sec,
         )
         _val_ds = AudioDataset(
             cfg, epoch_size=val_samples, seed=None,  # fresh samples each eval
-            qso_text_ratio=0.5, max_audio_sec=args.max_audio_sec,
+            qso_text_ratio=0.5, max_audio_sec=effective_max_audio_sec,
         )
         _train_loader = None
         if reuse_factor <= 1:

@@ -86,7 +86,11 @@ class RotaryEmbedding(nn.Module):
     bounded) don't silently truncate the RoPE slice.
     """
 
-    def __init__(self, dim: int, max_len: int = 4096, theta: float = 10000.0):
+    def __init__(self, dim: int, max_len: int = 8192, theta: float = 10000.0):
+        # max_len 8192 covers up to 163 s of audio at 50 fps CTC frame
+        # rate -- enough for 90 s training samples with margin. Auto-
+        # extends in eager mode if a longer streaming session arrives;
+        # ONNX export pre-extends to a baked size in quantize_cwformer.py.
         super().__init__()
         self.dim = dim
         self.theta = theta
