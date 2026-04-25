@@ -5,3 +5,6 @@ soundfile
 onnxruntime
 sounddevice  # Only needed for --device (live audio capture)
 scipy        # Only needed if input audio isn't at 16 kHz (resampling fallback)
+matplotlib   # Only needed for deploy/gui.py (the cross-platform GUI)
+# Note: deploy/gui.py also needs Tkinter. That ships with Python on Windows
+# and macOS; on Linux install via your package manager (e.g. python3-tk).
