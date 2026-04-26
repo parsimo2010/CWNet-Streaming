@@ -1066,6 +1066,44 @@ def _build_segment_audio(
     return (clean * amplitude).astype(np.float32)
 
 
+def _sample_edge_silence(
+    config: MorseConfig, rng: np.random.Generator,
+) -> float:
+    """Edge silence in seconds, exponential-tailed and clipped to [0, max].
+
+    Mean is the configured ``multi_segment_edge_silence_scale_sec`` so most
+    samples have short edge silence, but the long tail produces multi-second
+    leading or trailing dead air -- training the model to treat long silence
+    as a normal signal regardless of where it lands in the sample.
+    """
+    cap = float(config.multi_segment_leading_silence_max_sec)
+    scale = max(1e-3, float(config.multi_segment_edge_silence_scale_sec))
+    return float(np.clip(rng.exponential(scale=scale), 0.0, cap))
+
+
+def _sample_segment_gap_wide(
+    config: MorseConfig, rng: np.random.Generator, remaining_budget: float,
+) -> float:
+    """Gap between segments. Short-biased mass + a long tail up to
+    ``min(multi_segment_gap_long_max_sec, remaining_budget)`` so long
+    silences are reachable without ever exceeding the remaining audio
+    budget. Falls back to ``multi_segment_gap_min`` when the remaining
+    budget is too tight for a meaningful gap.
+    """
+    lo = float(config.multi_segment_gap_min)
+    long_cap = max(lo, min(
+        float(config.multi_segment_gap_long_max_sec),
+        float(remaining_budget),
+    ))
+    if rng.random() < config.multi_segment_gap_short_prob:
+        short_cap = max(lo, min(1.5, long_cap))
+        return float(rng.uniform(lo, short_cap))
+    short_floor = max(lo, 1.5)
+    if long_cap <= short_floor:
+        return float(rng.uniform(lo, long_cap))
+    return float(rng.uniform(short_floor, long_cap))
+
+
 def _compose_multi_segment(
     config: MorseConfig,
     rng: np.random.Generator,
@@ -1073,13 +1111,31 @@ def _compose_multi_segment(
     max_duration_sec: float,
     letter_alternation: bool = False,
 ) -> Tuple[np.ndarray, str, Dict]:
-    """Render a multi-sender clean signal with leading/trailing/gap silences.
+    """Render a (possibly multi-sender) clean signal with randomized
+    leading/trailing/gap silences and randomized segment durations.
+
+    Algorithm (sequential-segment branch):
+      * Sample n_segments in [count_min, count_max]; n=1 is permitted so
+        single-sender samples also benefit from the wide edge-silence
+        distribution.
+      * Sample leading and trailing silence independently from an
+        exponential distribution clipped to [0, edge_max] (default 10 s).
+      * Build segments one at a time: for all but the last, draw a
+        log-uniform short-burst length in
+        [short_burst_chars_min, short_burst_chars_max]. The last
+        segment fills whatever audio budget remains at its WPM.
+      * Sample inter-segment gaps from a short-biased distribution with
+        a long tail up to ``multi_segment_gap_long_max_sec``, clipped to
+        the remaining budget so the sample never exceeds
+        ``max_duration_sec``.
+      * Shuffle the resulting per-segment specs so the "long" remainder
+        segment is no longer always last and boundary positions become
+        unpredictable.
+
+    The letter-alternation branch keeps its original structure.
 
     Returns ``(clean_audio, joined_text, partial_metadata)``. The caller
-    is expected to apply a single shared noise floor + AGC + the rest
-    of the augmentation pipeline. The ``partial_metadata`` carries the
-    list of segment pitches and WPMs so the bandpass step can pick a
-    centre that covers them all.
+    applies the shared noise floor + AGC + bandpass on the composed audio.
     """
     sample_rate = config.sample_rate
     base_amp = float(rng.uniform(
@@ -1096,58 +1152,91 @@ def _compose_multi_segment(
         gap_hi = config.letter_alternation_gap_max
         gaps = [float(rng.uniform(gap_lo, gap_hi))
                 for _ in range(n_segments - 1)]
-        # Letter-alternation pitch: tight band around a session centre
         session_pitch = float(rng.uniform(
             config.tone_freq_min, config.tone_freq_max,
         ))
         pitch_jitter = config.letter_alternation_pitch_jitter_hz
-    else:
-        n_segments = int(rng.integers(
-            config.multi_segment_count_min,
-            config.multi_segment_count_max + 1,
-        ))
-        gaps = [_sample_segment_gap(config, rng)
-                for _ in range(n_segments - 1)]
-        session_pitch = None
-        pitch_jitter = None
 
-    leading_sec = float(rng.uniform(0.5, 1.5))
-    trailing_sec = float(rng.uniform(0.5, 1.5))
-    silence_total = leading_sec + trailing_sec + sum(gaps)
-    seg_budget = max_duration_sec - silence_total
-    if seg_budget < 1.5 * n_segments:
-        # Not enough room: shrink gaps proportionally, then segments.
-        # In the worst case, fall back to a single segment.
-        gap_total = sum(gaps)
-        if gap_total > 0:
-            shrink = max(
-                0.0,
-                (max_duration_sec - leading_sec - trailing_sec
-                 - 1.5 * n_segments) / gap_total
-            )
-            gaps = [g * shrink for g in gaps]
-            silence_total = leading_sec + trailing_sec + sum(gaps)
-            seg_budget = max_duration_sec - silence_total
+        leading_sec = float(rng.uniform(0.5, 1.5))
+        trailing_sec = float(rng.uniform(0.5, 1.5))
+        silence_total = leading_sec + trailing_sec + sum(gaps)
+        seg_budget = max_duration_sec - silence_total
         if seg_budget < 1.5 * n_segments:
-            n_segments = max(1, int(seg_budget / 1.5))
-            gaps = gaps[:max(0, n_segments - 1)]
-    per_seg_dur = max(1.0, seg_budget / max(n_segments, 1))
+            gap_total = sum(gaps)
+            if gap_total > 0:
+                shrink = max(
+                    0.0,
+                    (max_duration_sec - leading_sec - trailing_sec
+                     - 1.5 * n_segments) / gap_total
+                )
+                gaps = [g * shrink for g in gaps]
+                silence_total = leading_sec + trailing_sec + sum(gaps)
+                seg_budget = max_duration_sec - silence_total
+            if seg_budget < 1.5 * n_segments:
+                n_segments = max(1, int(seg_budget / 1.5))
+                gaps = gaps[:max(0, n_segments - 1)]
 
-    # Build per-segment params with similarity bias on adjacent pairs.
-    seg_specs = []
-    prev_wpm = None
-    prev_freq = None
-    prev_key = None
-    for i in range(n_segments):
-        if letter_alternation:
+        seg_specs: List[Dict] = []
+        for _ in range(n_segments):
             wpm = float(rng.uniform(config.min_wpm, config.max_wpm))
             base_freq = float(np.clip(
                 session_pitch + rng.uniform(-pitch_jitter, pitch_jitter),
                 config.tone_freq_min, config.tone_freq_max,
             ))
             key_type = _select_key_type(config.key_type_weights, rng)
-            target_chars = 1
-        else:
+            farnsworth_stretch = 1.0
+            if (config.farnsworth_probability > 0.0
+                    and rng.random() < config.farnsworth_probability):
+                farnsworth_stretch = float(rng.uniform(
+                    config.farnsworth_char_speed_min,
+                    config.farnsworth_char_speed_max,
+                ))
+            amp_offset_db = float(rng.uniform(-amp_jitter_db, 0.0))
+            amplitude = base_amp * (10.0 ** (amp_offset_db / 20.0))
+            text = chr(int(rng.integers(ord("A"), ord("Z") + 1)))
+            seg_specs.append({
+                "text": text, "wpm": wpm, "base_freq": base_freq,
+                "key_type": key_type, "amplitude": amplitude,
+                "farnsworth_stretch": farnsworth_stretch,
+            })
+    else:
+        n_segments = int(rng.integers(
+            config.multi_segment_count_min,
+            config.multi_segment_count_max + 1,
+        ))
+
+        leading_sec = _sample_edge_silence(config, rng)
+        trailing_sec = float(np.clip(
+            rng.exponential(scale=max(1e-3, config.multi_segment_edge_silence_scale_sec)),
+            0.0, config.multi_segment_trailing_silence_max_sec,
+        ))
+        # Budget reserved for actual signal across all segments. Edge
+        # silences and gaps are subtracted as we go to avoid overshoot.
+        budget_remaining = max_duration_sec - leading_sec - trailing_sec
+        if budget_remaining < 1.5:
+            # Edge silence ate everything: trim it back so a minimal
+            # single segment can still fit.
+            shrink = max(0.0, max_duration_sec - 1.5)
+            total_edge = leading_sec + trailing_sec
+            if total_edge > 0:
+                ratio = shrink / total_edge
+                leading_sec *= ratio
+                trailing_sec *= ratio
+            budget_remaining = max_duration_sec - leading_sec - trailing_sec
+
+        burst_lo = max(1, int(config.multi_segment_short_burst_chars_min))
+        burst_hi = max(burst_lo, int(config.multi_segment_short_burst_chars_max))
+        log_lo = math.log(burst_lo)
+        log_hi = math.log(burst_hi + 1)
+
+        seg_specs = []
+        gaps: List[float] = []
+        prev_wpm: Optional[float] = None
+        prev_freq: Optional[float] = None
+        prev_key: Optional[str] = None
+        for i in range(n_segments):
+            is_last = (i == n_segments - 1)
+
             if prev_wpm is None:
                 wpm = float(rng.uniform(config.min_wpm, config.max_wpm))
                 base_freq = float(rng.uniform(
@@ -1165,26 +1254,27 @@ def _compose_multi_segment(
                     key_type = _select_key_type(
                         config.key_type_weights, rng,
                     )
-            target_chars = max(3, int(per_seg_dur * wpm / 10.0 * 0.75))
 
-        # Farnsworth: per-segment decision (operator-specific habit)
-        farnsworth_stretch = 1.0
-        if (config.farnsworth_probability > 0.0
-                and rng.random() < config.farnsworth_probability):
-            farnsworth_stretch = float(rng.uniform(
-                config.farnsworth_char_speed_min,
-                config.farnsworth_char_speed_max,
-            ))
+            farnsworth_stretch = 1.0
+            if (config.farnsworth_probability > 0.0
+                    and rng.random() < config.farnsworth_probability):
+                farnsworth_stretch = float(rng.uniform(
+                    config.farnsworth_char_speed_min,
+                    config.farnsworth_char_speed_max,
+                ))
 
-        # Per-segment amplitude (dB below base, one-sided, so each
-        # segment is equal-or-quieter than nominal -- mimics fading).
-        amp_offset_db = float(rng.uniform(-amp_jitter_db, 0.0))
-        amplitude = base_amp * (10.0 ** (amp_offset_db / 20.0))
+            amp_offset_db = float(rng.uniform(-amp_jitter_db, 0.0))
+            amplitude = base_amp * (10.0 ** (amp_offset_db / 20.0))
 
-        if letter_alternation:
-            # Choose a single random alphanumeric character.
-            text = chr(int(rng.integers(ord("A"), ord("Z") + 1)))
-        else:
+            if not is_last:
+                target_chars = int(math.exp(rng.uniform(log_lo, log_hi)))
+                target_chars = max(1, min(burst_hi, target_chars))
+            else:
+                # Fill the remainder of the audio budget at this WPM.
+                # ~10 chars/s at 50 WPM, ~1 char/s at 5 WPM.
+                target_chars = int(max(0.0, budget_remaining) * wpm / 10.0)
+                target_chars = max(1, min(200, target_chars))
+
             text = generate_text(
                 rng,
                 min_chars=min(8, target_chars),
@@ -1192,18 +1282,47 @@ def _compose_multi_segment(
                 wordlist=wordlist,
             )
 
-        seg_specs.append({
-            "text": text, "wpm": wpm, "base_freq": base_freq,
-            "key_type": key_type, "amplitude": amplitude,
-            "farnsworth_stretch": farnsworth_stretch,
-        })
-        prev_wpm, prev_freq, prev_key = wpm, base_freq, key_type
+            seg_specs.append({
+                "text": text, "wpm": wpm, "base_freq": base_freq,
+                "key_type": key_type, "amplitude": amplitude,
+                "farnsworth_stretch": farnsworth_stretch,
+            })
+            prev_wpm, prev_freq, prev_key = wpm, base_freq, key_type
 
-    # Render and stitch.
+            # Estimate this segment's audio length and consume budget.
+            est_seg_dur = (len(text) + 1) * 60.0 / max(wpm, 1.0) / 5.0
+            budget_remaining -= est_seg_dur
+
+            if not is_last:
+                gap = _sample_segment_gap_wide(
+                    config, rng, max(0.0, budget_remaining),
+                )
+                gaps.append(gap)
+                budget_remaining -= gap
+
+        # Shuffle so the "remainder" segment is not always last.
+        # Adjacent-pair similarity bias (built into the per-segment loop)
+        # is preserved in expectation: roughly a third of the post-shuffle
+        # adjacent pairs were originally adjacent.
+        order = list(range(len(seg_specs)))
+        rng.shuffle(order)
+        seg_specs = [seg_specs[k] for k in order]
+
+    # Render and stitch. Track cumulative samples and drop any segment
+    # (and all subsequent segments + their preceding gaps) whose rendered
+    # audio would exceed the cap. Per-segment estimates undercount when
+    # Farnsworth/timing-jitter/speed-drift slack is added at render time;
+    # truncating audio without truncating text would teach CTC to emit
+    # characters with no acoustic evidence.
+    cap_samples = int(max_duration_sec * sample_rate)
     chunks: List[np.ndarray] = []
     text_parts: List[str] = []
-    chunks.append(np.zeros(int(leading_sec * sample_rate), dtype=np.float32))
-    rendered_specs = []
+    leading_samples = int(leading_sec * sample_rate)
+    chunks.append(np.zeros(leading_samples, dtype=np.float32))
+    cumulative_samples = leading_samples
+    rendered_specs: List[Dict] = []
+    rendered_gaps: List[float] = []
+    dropped_segments = 0
     for i, spec in enumerate(seg_specs):
         seg_audio = _build_segment_audio(
             config, rng,
@@ -1214,31 +1333,61 @@ def _compose_multi_segment(
         )
         if seg_audio is None or len(seg_audio) == 0:
             continue
+        if cumulative_samples + len(seg_audio) > cap_samples:
+            # Dropping this segment also drops any later segments (and the
+            # gap that would have preceded each of them). Partial segments
+            # are not a valid training signal, so we stop here.
+            dropped_segments = len(seg_specs) - i
+            break
         chunks.append(seg_audio)
+        cumulative_samples += len(seg_audio)
         text_parts.append(spec["text"])
         rendered_specs.append(spec)
-        if i < len(gaps) and gaps[i] > 0:
-            chunks.append(np.zeros(
-                int(gaps[i] * sample_rate), dtype=np.float32,
-            ))
-    chunks.append(np.zeros(int(trailing_sec * sample_rate), dtype=np.float32))
+        if i < len(gaps) and gaps[i] > 0 and i < len(seg_specs) - 1:
+            gap_samples = int(gaps[i] * sample_rate)
+            if cumulative_samples + gap_samples > cap_samples:
+                # Gap alone overshoots: keep the segment we just appended
+                # but drop the gap and everything that would follow it.
+                dropped_segments = len(seg_specs) - (i + 1)
+                break
+            chunks.append(np.zeros(gap_samples, dtype=np.float32))
+            cumulative_samples += gap_samples
+            rendered_gaps.append(float(gaps[i]))
+
+    # Shrink trailing silence to whatever budget is left.
+    trailing_samples = int(trailing_sec * sample_rate)
+    remaining = cap_samples - cumulative_samples
+    if trailing_samples > remaining:
+        trailing_samples = max(0, remaining)
+        trailing_sec = trailing_samples / sample_rate
+    chunks.append(np.zeros(trailing_samples, dtype=np.float32))
+    cumulative_samples += trailing_samples
 
     if not text_parts:
         raise ValueError("multi-segment composition produced no audio")
 
     clean_audio = np.concatenate(chunks).astype(np.float32)
+
+    assert clean_audio.shape[0] <= cap_samples, (
+        f"multi-segment overshoot: {clean_audio.shape[0]} > {cap_samples}"
+    )
+    if clean_audio.shape[0] > cap_samples:
+        clean_audio = clean_audio[:cap_samples]
+
     joined_text = " ".join(text_parts)
 
     metadata: Dict = {
         "multi_segment": True,
         "letter_alternation": letter_alternation,
         "n_segments": len(rendered_specs),
+        "n_rendered_segments": len(rendered_specs),
+        "n_dropped_segments": dropped_segments,
         "segment_pitches": [s["base_freq"] for s in rendered_specs],
         "segment_wpms": [s["wpm"] for s in rendered_specs],
         "segment_key_types": [s["key_type"] for s in rendered_specs],
         "leading_silence_sec": leading_sec,
         "trailing_silence_sec": trailing_sec,
-        "gap_durations_sec": gaps[:len(rendered_specs) - 1],
+        "gap_durations_sec": rendered_gaps,
         "target_amplitude": base_amp,
     }
     return clean_audio, joined_text, metadata
@@ -1486,6 +1635,7 @@ def generate_sample(
             "qsb_depth_db": 0.0,            # per-segment, not whole-sample
             "leading_silence_sec": ms_meta["leading_silence_sec"],
             "trailing_silence_sec": ms_meta["trailing_silence_sec"],
+            "gap_durations_sec": ms_meta["gap_durations_sec"],
             "timing_jitter": 0.0,
             "dah_dit_ratio": 0.0,
             "ics_factor": 0.0,
@@ -1496,6 +1646,10 @@ def generate_sample(
             "multi_segment": True,
             "letter_alternation": ms_meta["letter_alternation"],
             "n_segments": ms_meta["n_segments"],
+            "n_rendered_segments": ms_meta.get(
+                "n_rendered_segments", ms_meta["n_segments"],
+            ),
+            "n_dropped_segments": ms_meta.get("n_dropped_segments", 0),
             "segment_pitches": ms_meta["segment_pitches"],
             "segment_wpms": ms_meta["segment_wpms"],
             "segment_key_types": ms_meta["segment_key_types"],

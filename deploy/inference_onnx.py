@@ -429,6 +429,7 @@ class CWFormerStreamingONNX:
         config_path: Optional[str] = None,
         chunk_ms: int = 500,
         max_cache_sec: float = 30.0,
+        blank_trim_sec: float = 5.0,
     ) -> None:
         import onnxruntime as ort
 
@@ -454,6 +455,13 @@ class CWFormerStreamingONNX:
         self._max_cache_len = int(max_cache_sec * 50)  # ~50fps after 2x subsample
         self._freq1 = math.ceil(self._n_mels / 2)
 
+        # Silence-triggered KV cache reset. Encoder runs at ~50 fps
+        # (2x subsample on a 10 ms hop). 0 or negative disables.
+        if blank_trim_sec > 0:
+            self._blank_trim_frames = int(blank_trim_sec * 50)
+        else:
+            self._blank_trim_frames = 0
+
         self.session = ort.InferenceSession(
             model_path, providers=["CPUExecutionProvider"])
 
@@ -465,7 +473,10 @@ class CWFormerStreamingONNX:
         self._stft_buffer: Optional[np.ndarray] = None
         self._audio_buffer = np.zeros(0, dtype=np.float32)
         self._all_log_probs: List[np.ndarray] = []
+        self._greedy_argmax: List[int] = []
+        self._silence_reset_armed = True
         self._emitted_text = ""
+        self._committed_text = ""
 
     def _init_state(self) -> Dict[str, np.ndarray]:
         """Create zero-initialized state tensors."""
@@ -504,7 +515,7 @@ class CWFormerStreamingONNX:
         if not self._all_log_probs:
             return self._emitted_text
         all_lp = np.concatenate(self._all_log_probs, axis=0)
-        return greedy_ctc_decode(all_lp)
+        return self._committed_text + greedy_ctc_decode(all_lp)
 
     def flush(self) -> str:
         """Process remaining audio. Call at end of stream.
@@ -623,15 +634,41 @@ class CWFormerStreamingONNX:
         if T_out > 0:
             lp = log_probs[:, 0, :]
             self._all_log_probs.append(lp)
+            self._greedy_argmax.extend(np.argmax(lp, axis=-1).tolist())
 
             # Decode everything and emit new characters immediately
             all_lp = np.concatenate(self._all_log_probs, axis=0)
-            full_text = greedy_ctc_decode(all_lp)
+            full_text = self._committed_text + greedy_ctc_decode(all_lp)
             new_chars = full_text[len(self._emitted_text):]
             self._emitted_text = full_text
+
+            self._maybe_silence_reset()
             return new_chars
 
         return ""
+
+    def _maybe_silence_reset(self) -> None:
+        """Flush ONNX streaming state when the trailing argmax window is silent.
+
+        Replaces KV caches, conv buffers, sub buffers, and ``pos_offset``
+        with their zero-init values; preserves the mel STFT overlap so the
+        next chunk's spectrogram remains continuous. Each silent stretch
+        fires the reset at most once.
+        """
+        n = self._blank_trim_frames
+        if n <= 0 or len(self._greedy_argmax) < n:
+            return
+
+        tail = self._greedy_argmax[-n:]
+        all_silent = all(idx == 0 or idx == 1 for idx in tail)
+        if all_silent and self._silence_reset_armed:
+            self._state = self._init_state()
+            self._committed_text = self._emitted_text
+            self._all_log_probs = []
+            self._greedy_argmax = []
+            self._silence_reset_armed = False
+        elif not all_silent:
+            self._silence_reset_armed = True
 
 
 # ---------------------------------------------------------------------------
@@ -661,6 +698,10 @@ def main() -> None:
     parser.add_argument("--chunk-ms", type=int, default=500, metavar="MS",
                         dest="chunk_ms",
                         help="Processing chunk size in milliseconds")
+    parser.add_argument("--blank-trim-sec", type=float, default=5.0,
+                        metavar="SEC", dest="blank_trim_sec",
+                        help="Reset KV cache after this many seconds of "
+                             "blank/space-only output. 0 disables.")
 
     # Display
     parser.add_argument("--lines", type=int, default=8, metavar="N",
@@ -679,6 +720,7 @@ def main() -> None:
         model_path=args.model,
         config_path=args.config,
         chunk_ms=args.chunk_ms,
+        blank_trim_sec=args.blank_trim_sec,
     )
 
     model_name = Path(args.model).name

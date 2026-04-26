@@ -126,20 +126,27 @@ normalized recordings at inference time.
 
 See `create_default_config()` in `config.py` for exact per-stage values.
 
-**Multi-segment** (moderate/full): each sample composes 2–4 sequential
+**Multi-segment** (moderate/full): each sample composes 1–4 sequential
 operator segments separated by silent gaps, with a single shared noise
 floor / AGC / bandpass (one radio listening to multiple ops). Trains
 the streaming KV cache to release context after a gap rather than
 locking onto one signal — directly attacks the state-drift failure
 mode that drops 60%+ of letters on long real-world recordings.
-Adjacent segments are **biased toward similarity**: 35% same-mel-bin
-pitch (0–10 Hz), 30% near (10–50 Hz), 25% medium (50–200 Hz), 10%
-wide; WPM tiers 30/35/25/10% match/close/diff/wide; 50% same key type.
-The same-bin + matched-WPM + same-key case forces fist-only
-discrimination with the gap as the sole context-release cue. Gap
-distribution is short-biased (60% under 1.5 s) to teach fast cache
-release. **Run moderate/full with `--max-audio-sec 90`** so segments
-+ gaps fit.
+Segment durations are **randomized**: all but one segment is a short
+log-uniform burst (1–15 chars), the remaining segment fills the
+audio-budget remainder, and the per-segment order is shuffled so the
+long segment doesn't always land last. n=1 is allowed inside this
+branch so single-sender samples also see the wide edge-silence
+distribution. Adjacent segments are **biased toward similarity**:
+35% same-mel-bin pitch (0–10 Hz), 30% near (10–50 Hz), 25% medium
+(50–200 Hz), 10% wide; WPM tiers 30/35/25/10%
+match/close/diff/wide; 50% same key type. Leading and trailing
+silences are sampled independently from an exponential (mean ~2 s,
+clipped to 0–10 s); inter-segment gaps are short-biased (60% under
+1.5 s) with a long tail up to 15 s, clipped to remaining budget.
+The randomized layout removes positional bias in boundary times.
+**Run moderate/full with `--max-audio-sec 30`** — the model's
+`max_cache_sec` is 30 s, so longer audio doesn't help.
 
 **Letter alternation** (Tier 3, full only): 5% of multi-segment samples
 render each letter as a separate "operator" with ±15 Hz pitch jitter

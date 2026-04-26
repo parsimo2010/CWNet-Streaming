@@ -172,14 +172,33 @@ class MorseConfig:
     # signal -- this is the fix for the state-drift failure mode seen
     # on long real-world recordings.
     multi_segment_probability: float = 0.0
-    multi_segment_count_min: int = 2
+    multi_segment_count_min: int = 1
     multi_segment_count_max: int = 4
 
+    # Edge-silence distribution (seconds). Spans 0-10 s with an
+    # exponential-tailed bias toward short silences so the model sees
+    # a wide range of "leading dead air" without losing the typical
+    # short-edge case.
+    multi_segment_leading_silence_max_sec: float = 10.0
+    multi_segment_trailing_silence_max_sec: float = 10.0
+    multi_segment_edge_silence_scale_sec: float = 2.0
+
     # Gap distribution (seconds). The short-gap mass forces fast cache
-    # release; long tail covers operator pauses.
+    # release; the long tail (up to ~15 s) covers extended operator
+    # pauses so the model treats long silence as a normal training
+    # signal rather than a positional cue.
     multi_segment_gap_min: float = 0.3
     multi_segment_gap_max: float = 5.0
     multi_segment_gap_short_prob: float = 0.6   # prob gap <= 1.5 s
+    multi_segment_gap_long_max_sec: float = 15.0
+
+    # Per-segment short-burst character budget. All segments except the
+    # last are sized as a small log-uniform burst in this range; the
+    # last segment fills whatever budget remains. Combined with the
+    # post-build random shuffle, this removes the predictable boundary
+    # times that fall out of equal slot division.
+    multi_segment_short_burst_chars_min: int = 1
+    multi_segment_short_burst_chars_max: int = 15
 
     # Pitch contrast tiers (Hz) between adjacent segments. Probabilities
     # for the four tiers; residual goes to the widest tier. Same-bin
@@ -464,9 +483,13 @@ def create_default_config(scenario: str = "clean") -> Config:
         # Multi-segment (multiple sequential senders per sample). Trains
         # the streaming KV cache to release context after a gap rather
         # than locking onto one signal -- the fix for state drift on
-        # long real-world sessions. Run with --max-audio-sec 90.
+        # long real-world sessions. Edge silence spans 0-10 s; gaps
+        # span up to 15 s. Segment durations are randomized (short
+        # bursts + remainder, post-build shuffle) so boundary times do
+        # not cluster at predictable positions. Run with
+        # --max-audio-sec 30.
         cfg.morse.multi_segment_probability = 0.40
-        cfg.morse.multi_segment_count_min = 2
+        cfg.morse.multi_segment_count_min = 1
         cfg.morse.multi_segment_count_max = 3
         # Letter alternation: full stage only.
         cfg.morse.letter_alternation_probability = 0.0
@@ -540,10 +563,13 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.input_gain_db_range = (-12.0, 12.0)
         # Multi-segment: dominant at full stage (most samples have
         # multiple senders so the model rarely sees a single coherent
-        # signal context for the whole sample length). Run with
-        # --max-audio-sec 90.
+        # signal context for the whole sample length). n_segments=1
+        # is allowed inside the multi-segment branch so that the wide
+        # 0-10 s edge-silence distribution and shuffled-burst layout
+        # also apply to single-sender samples. Edge silence spans
+        # 0-10 s; gaps span up to 15 s. Run with --max-audio-sec 30.
         cfg.morse.multi_segment_probability = 0.75
-        cfg.morse.multi_segment_count_min = 2
+        cfg.morse.multi_segment_count_min = 1
         cfg.morse.multi_segment_count_max = 4
         # Tier 3: letter-by-letter sender alternation. ~5% of multi-
         # segment samples (i.e. ~3% overall in this stage) become

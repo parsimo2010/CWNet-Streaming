@@ -154,6 +154,14 @@ class CWFormerStreamingDecoder:
             Extending beyond this relies on RoPE extrapolation, which
             degrades accuracy on long audio. Set to None to use the cache
             length stored in the checkpoint config.
+        blank_trim_sec: If the rolling greedy-argmax window of this many
+            seconds contains only blank (idx 0) and space (idx 1) frames,
+            actively flush the encoder state (KV cache, conv buffers,
+            sub buffers, pos_offset). Mel STFT overlap is preserved so
+            the next chunk's spectrogram remains continuous. Re-arms only
+            after a non-blank-non-space frame is observed, so each silent
+            stretch fires the reset at most once. Default 5.0 seconds.
+            Pass None or a non-positive value to disable.
     """
 
     def __init__(
@@ -162,6 +170,7 @@ class CWFormerStreamingDecoder:
         chunk_ms: int = 500,
         device: str = "cpu",
         max_cache_sec: Optional[float] = 30.0,
+        blank_trim_sec: Optional[float] = 5.0,
     ) -> None:
         self.device = torch.device(device)
         self.chunk_ms = chunk_ms
@@ -172,10 +181,16 @@ class CWFormerStreamingDecoder:
 
         # Cap KV cache to match training distribution (relative positions
         # exceeding training's max are RoPE extrapolation territory).
+        # CTC output frames are at 50 fps (2× subsampling from 10 ms mel).
+        frames_per_sec = self.sample_rate // self._model_cfg.mel.hop_length // 2
         if max_cache_sec is not None:
-            # CTC output frames are at 50 fps (2× subsampling from 10 ms mel).
-            frames_per_sec = self.sample_rate // self._model_cfg.mel.hop_length // 2
             self._model.config.conformer.max_cache_len = int(max_cache_sec * frames_per_sec)
+
+        # Silence-triggered KV cache reset.
+        if blank_trim_sec is not None and blank_trim_sec > 0:
+            self._blank_trim_frames = int(blank_trim_sec * frames_per_sec)
+        else:
+            self._blank_trim_frames = 0
 
         # Chunk size in samples
         self._chunk_samples = int(chunk_ms * self.sample_rate / 1000)
@@ -192,6 +207,7 @@ class CWFormerStreamingDecoder:
         chunk_ms: int = 500,
         device: Optional[torch.device] = None,
         max_cache_sec: Optional[float] = 30.0,
+        blank_trim_sec: Optional[float] = 5.0,
     ) -> "CWFormerStreamingDecoder":
         """Build a decoder around an already-instantiated model.
 
@@ -214,11 +230,16 @@ class CWFormerStreamingDecoder:
         self._model_cfg = model_cfg
         self.sample_rate = sample_rate
 
+        frames_per_sec = sample_rate // model_cfg.mel.hop_length // 2
         if max_cache_sec is not None:
-            frames_per_sec = sample_rate // model_cfg.mel.hop_length // 2
             model.config.conformer.max_cache_len = int(
                 max_cache_sec * frames_per_sec
             )
+
+        if blank_trim_sec is not None and blank_trim_sec > 0:
+            self._blank_trim_frames = int(blank_trim_sec * frames_per_sec)
+        else:
+            self._blank_trim_frames = 0
 
         self._chunk_samples = int(chunk_ms * sample_rate / 1000)
         self.reset()
@@ -229,7 +250,10 @@ class CWFormerStreamingDecoder:
         self._audio_buffer = np.zeros(0, dtype=np.float32)
         self._model_state = self._model.init_streaming_state(self.device)
         self._all_log_probs: list[Tensor] = []
+        self._greedy_argmax: list[int] = []
+        self._silence_reset_armed = True
         self._emitted_text = ""
+        self._committed_text = ""
 
     def feed_audio(self, audio_chunk: np.ndarray) -> str:
         """Feed raw audio samples, return NEW characters decoded since last call.
@@ -259,7 +283,7 @@ class CWFormerStreamingDecoder:
             return self._emitted_text
 
         all_lp = torch.cat(self._all_log_probs, dim=0)
-        return self._greedy_decode(all_lp)
+        return self._committed_text + self._greedy_decode(all_lp)
 
     def flush(self) -> str:
         """Process any remaining buffered audio. Call at end of stream.
@@ -340,14 +364,41 @@ class CWFormerStreamingDecoder:
         # Accumulate log_probs (T, B, C) -> take batch 0 -> (T, C)
         lp = log_probs[:, 0, :].cpu()
         self._all_log_probs.append(lp)
+        self._greedy_argmax.extend(lp.argmax(dim=-1).tolist())
 
         # Decode everything and emit new characters
         all_lp = torch.cat(self._all_log_probs, dim=0)
-        full_text = self._greedy_decode(all_lp)
+        full_text = self._committed_text + self._greedy_decode(all_lp)
 
         new_chars = full_text[len(self._emitted_text):]
         self._emitted_text = full_text
+
+        self._maybe_silence_reset()
         return new_chars
+
+    def _maybe_silence_reset(self) -> None:
+        """Flush encoder state if the trailing window is blank/space only.
+
+        Mel STFT overlap (``stft_buffer``) is preserved so the spectrogram
+        stays continuous across the reset. Already-emitted text is kept
+        (CTC prefix stability holds even across resets).
+        """
+        n = self._blank_trim_frames
+        if n <= 0 or len(self._greedy_argmax) < n:
+            return
+
+        tail = self._greedy_argmax[-n:]
+        all_silent = all(idx == 0 or idx == 1 for idx in tail)
+        if all_silent and self._silence_reset_armed:
+            stft_buffer = self._model_state.get('stft_buffer')
+            self._model_state = self._model.init_streaming_state(self.device)
+            self._model_state['stft_buffer'] = stft_buffer
+            self._committed_text = self._emitted_text
+            self._all_log_probs = []
+            self._greedy_argmax = []
+            self._silence_reset_armed = False
+        elif not all_silent:
+            self._silence_reset_armed = True
 
     @staticmethod
     def _greedy_decode(log_probs: Tensor) -> str:
@@ -375,6 +426,10 @@ def main():
                         help="Processing chunk size in milliseconds")
     parser.add_argument("--device", default="cpu",
                         help="Device (cpu or cuda)")
+    parser.add_argument("--blank-trim-sec", type=float, default=5.0,
+                        metavar="SEC", dest="blank_trim_sec",
+                        help="Reset KV cache after this many seconds of "
+                             "blank/space-only output. 0 disables.")
 
     args = parser.parse_args()
 
@@ -382,6 +437,7 @@ def main():
         checkpoint=args.checkpoint,
         chunk_ms=args.chunk_ms,
         device=args.device,
+        blank_trim_sec=args.blank_trim_sec if args.blank_trim_sec > 0 else None,
     )
 
     print(f"[cwformer-streaming] chunk={dec.chunk_ms}ms "
