@@ -6,6 +6,12 @@ benchmarks, and demo tools report comparable numbers.
 
 Conventions:
   - Both sides are ``.strip().upper()``-normalised before comparison.
+  - Consecutive spaces are collapsed to a single space on both sides
+    before the edit-distance pass. Multi-segment training samples have
+    long inter-segment silences that the model legitimately decodes as
+    runs of multiple spaces; without collapsing, those extra spaces
+    would all count as insertions even though the transcript is
+    semantically correct.
   - CER = edit distance divided by reference length.
   - An empty reference yields CER = 0 if the hypothesis is also empty,
     else 1.0.
@@ -13,7 +19,16 @@ Conventions:
 
 from __future__ import annotations
 
+import re
 from typing import List
+
+
+_MULTI_SPACE = re.compile(r" +")
+
+
+def _normalize_for_cer(s: str) -> str:
+    """Strip, upper-case, and collapse consecutive ASCII spaces."""
+    return _MULTI_SPACE.sub(" ", s.strip().upper())
 
 
 def levenshtein(a: str, b: str) -> int:
@@ -33,9 +48,10 @@ def levenshtein(a: str, b: str) -> int:
 
 
 def compute_cer(hypothesis: str, reference: str) -> float:
-    """Character Error Rate. Both sides stripped and upper-cased."""
-    h = hypothesis.strip().upper()
-    r = reference.strip().upper()
+    """Character Error Rate. Both sides normalised: stripped, upper-cased,
+    consecutive spaces collapsed."""
+    h = _normalize_for_cer(hypothesis)
+    r = _normalize_for_cer(reference)
     if not r:
         return 0.0 if not h else 1.0
     return levenshtein(h, r) / len(r)
@@ -47,10 +63,13 @@ def per_position_errors(hypothesis: str, reference: str) -> List[bool]:
     Returns a list of booleans, one per reference character. ``True`` means
     that character was matched exactly in the optimal alignment; ``False``
     means it was substituted or deleted. Uses the standard DP matrix
-    backtrace to find the alignment.
+    backtrace to find the alignment. Reference and hypothesis are
+    normalised the same way as ``compute_cer`` (consecutive spaces
+    collapsed) so per-position alignment doesn't artificially flag
+    correctly-decoded long-silence regions as errors.
     """
-    h = hypothesis.strip().upper()
-    r = reference.strip().upper()
+    h = _normalize_for_cer(hypothesis)
+    r = _normalize_for_cer(reference)
     if not r:
         return []
 

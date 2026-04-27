@@ -48,7 +48,7 @@ import matplotlib.pyplot as plt
 # Make sibling modules importable.
 _ROOT = Path(__file__).resolve().parents[2]
 _DEPLOY = _ROOT / "deploy"
-for p in (_DEPLOY, _ROOT / "tests"):
+for p in (_ROOT, _DEPLOY, _ROOT / "tests"):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
@@ -63,6 +63,77 @@ from inference_onnx import (  # type: ignore  # noqa: E402
 
 
 SPACE_IDX = 1
+
+
+# ---------------------------------------------------------------------------
+# PyTorch adapter (same surface as CWFormerStreamingONNX)
+# ---------------------------------------------------------------------------
+
+class _PyTorchAdapter:
+    """Wrap CWFormerStreamingDecoder to mimic the ONNX wrapper's API.
+
+    Exposes: ``config`` (dict), ``sample_rate``, ``_chunk_samples``,
+    ``_all_log_probs`` (list of np arrays), ``reset()``, ``feed_audio()``,
+    ``flush()``, ``get_full_text()``, ``decode_audio()``. That is exactly
+    the surface ``run_streaming``, ``isolated_redecode`` and ``diagnose_one``
+    use against the ONNX wrapper.
+    """
+
+    def __init__(
+        self,
+        checkpoint: str,
+        chunk_ms: int = 500,
+        device: str = "cpu",
+        max_cache_sec: float = 5.0,
+        blank_trim_sec: float = 0.0,
+    ) -> None:
+        # Lazy import so the diag script still works without torch when
+        # using the ONNX path.
+        from neural_decoder.inference_cwformer import (  # type: ignore
+            CWFormerStreamingDecoder,
+        )
+
+        self._dec = CWFormerStreamingDecoder(
+            checkpoint=checkpoint,
+            chunk_ms=chunk_ms,
+            device=device,
+            max_cache_sec=max_cache_sec,
+            blank_trim_sec=None if blank_trim_sec <= 0 else blank_trim_sec,
+        )
+        self.sample_rate = self._dec.sample_rate
+        self.chunk_ms = chunk_ms
+        self._chunk_samples = self._dec._chunk_samples
+
+        mc = self._dec._model_cfg.mel
+        self.config = {
+            "sample_rate": mc.sample_rate,
+            "n_mels": mc.n_mels,
+            "n_fft": mc.n_fft,
+            "hop_length": mc.hop_length,
+            "f_min": float(mc.f_min),
+            "f_max": float(mc.f_max),
+        }
+
+    def reset(self) -> None:
+        self._dec.reset()
+
+    def feed_audio(self, chunk: np.ndarray) -> str:
+        return self._dec.feed_audio(chunk)
+
+    def flush(self) -> str:
+        return self._dec.flush()
+
+    def get_full_text(self) -> str:
+        return self._dec.get_full_text()
+
+    def decode_audio(self, audio: np.ndarray) -> str:
+        return self._dec.decode_audio(audio)
+
+    @property
+    def _all_log_probs(self):
+        # PyTorch decoder stores torch.Tensors of shape (T, C). The diag
+        # script concatenates these via np.concatenate, so convert.
+        return [lp.detach().cpu().numpy() for lp in self._dec._all_log_probs]
 
 
 def greedy_with_frames(log_probs: np.ndarray) -> List[Tuple[str, int]]:
@@ -544,7 +615,27 @@ def main() -> None:
     )
     parser.add_argument(
         "--model", default=str(_DEPLOY / "cwformer_streaming_fp32.onnx"),
-        help="ONNX model path (FP32 recommended for diagnostics)",
+        help="ONNX model path (FP32 recommended for diagnostics). Ignored "
+             "when --checkpoint is given.",
+    )
+    parser.add_argument(
+        "--checkpoint", default=None,
+        help="PyTorch .pt checkpoint. If set, runs the PyTorch streaming "
+             "decoder directly, bypassing ONNX export and quantization.",
+    )
+    parser.add_argument(
+        "--device", default="cpu",
+        help="Torch device for --checkpoint mode (cpu or cuda).",
+    )
+    parser.add_argument(
+        "--blank-trim-sec", type=float, default=5.0, dest="blank_trim_sec",
+        help="Silence-triggered KV cache reset threshold (seconds). "
+             "0 disables. Only affects --checkpoint mode (the ONNX wrapper "
+             "uses its own default).",
+    )
+    parser.add_argument(
+        "--max-cache-sec", type=float, default=5.0, dest="max_cache_sec",
+        help="KV cache cap in seconds. Only affects --checkpoint mode.",
     )
     parser.add_argument(
         "--recordings", default=str(_ROOT / "recordings"),
@@ -569,14 +660,33 @@ def main() -> None:
         print(f"No files matching {args.pattern} in {rec_dir}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[diag] model: {args.model}")
+    if args.checkpoint:
+        print(f"[diag] checkpoint: {args.checkpoint} (PyTorch, "
+              f"blank_trim_sec={args.blank_trim_sec}, "
+              f"max_cache_sec={args.max_cache_sec}, "
+              f"device={args.device})")
+    else:
+        print(f"[diag] model: {args.model}")
     print(f"[diag] {len(files)} file(s) in {rec_dir} matching {args.pattern}")
     print(f"[diag] output: {out_dir}")
 
-    dec = CWFormerStreamingONNX(model_path=args.model)
-    mel_computer = MelComputer(
-        dec.config, config_dir=str(Path(args.model).parent),
-    )
+    if args.checkpoint:
+        dec = _PyTorchAdapter(
+            checkpoint=args.checkpoint,
+            device=args.device,
+            blank_trim_sec=args.blank_trim_sec,
+            max_cache_sec=args.max_cache_sec,
+        )
+        # Display-only mel computer — no saved tables on disk for raw .pt
+        # checkpoints, so fall back to the legacy numpy filterbank. This is
+        # purely for the spectrogram subplot; the model uses its own torch
+        # mel internally.
+        mel_computer = MelComputer(dec.config, config_dir=None)
+    else:
+        dec = CWFormerStreamingONNX(model_path=args.model)
+        mel_computer = MelComputer(
+            dec.config, config_dir=str(Path(args.model).parent),
+        )
 
     results: List[Dict] = []
     for i, path in enumerate(files, 1):

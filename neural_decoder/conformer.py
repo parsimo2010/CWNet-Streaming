@@ -51,7 +51,15 @@ class ConformerConfig:
     conv_kernel: int = 63       # Depthwise conv kernel size
     dropout: float = 0.1        # Dropout rate
     max_seq_len: int = 4096     # Maximum sequence length for RoPE tables
-    max_cache_len: int = 1475   # Max KV cache frames (~29.5s at 50fps; leaves 25-frame chunk headroom vs 1500-frame training max)
+    # Sliding-window cap for self-attention. During training, each query
+    # frame attends to at most this many past key frames (causal window).
+    # During inference, the KV cache is trimmed to this size between
+    # chunks. Default 250 = 5 s at 50 fps, matching the inference window
+    # that real-world recordings need to avoid stale-operator state drift
+    # through QSO handoffs. Empirically, holding more than ~5 s of KV
+    # state across a fist+pitch+AGC change locks the model onto the
+    # previous operator's tokens.
+    max_cache_len: int = 250
 
 
 # ---------------------------------------------------------------------------
@@ -90,18 +98,27 @@ class FeedForwardModule(nn.Module):
 class ConformerMHA(nn.Module):
     """Multi-head self-attention with RoPE for the Conformer.
 
-    Fully causal self-attention: each frame attends only to past frames
-    and itself. Training uses is_causal=True (Flash Attention kernel).
-    Inference uses KV cache for state carry-forward between chunks.
+    Causal sliding-window self-attention: each frame attends to itself
+    and at most ``attention_window`` past frames. During training a
+    sliding-window causal mask is applied so the per-frame computation
+    matches what streaming inference does at runtime — inference keeps a
+    bounded KV cache of the same size and trims older frames between
+    chunks. With train and inference using the same window, the per-
+    frame outputs are numerically identical (subject to fp precision).
+    Setting ``attention_window`` >= sequence length collapses to plain
+    full causal attention and dispatches to the Flash kernel via
+    ``is_causal=True``.
     """
 
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1,
-                 max_seq_len: int = 4096):
+                 max_seq_len: int = 4096,
+                 attention_window: Optional[int] = None):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
+        self.attention_window = attention_window
 
         self.layer_norm = nn.LayerNorm(d_model)
         self.W_qkv = nn.Linear(d_model, 3 * d_model)
@@ -146,11 +163,29 @@ class ConformerMHA(nn.Module):
         q, k = self.rope(q, k, offset=pos_offset)
 
         if kv_cache is None:
-            # --- Training / full-sequence eval: causal SDPA ---
+            # --- Training / full-sequence eval ---
             dropout_p = self.attn_dropout.p if self.training else 0.0
-            out = F.scaled_dot_product_attention(
-                q, k, v, dropout_p=dropout_p, is_causal=True,
-            )  # (B, H, T, d_k)
+            window = self.attention_window
+            # Use sliding-window causal mask if a window smaller than the
+            # sequence is configured. Otherwise fall back to full causal
+            # via is_causal=True (Flash Attention kernel).
+            if window is not None and window < T - 1:
+                # Build (T, T) causal-window mask. Query at position q
+                # attends to key at position k iff 0 <= q - k <= window.
+                idx = torch.arange(T, device=x.device)
+                delta = idx.unsqueeze(1) - idx.unsqueeze(0)  # (T, T)
+                allowed = (delta >= 0) & (delta <= window)
+                # SDPA expects a float additive mask: 0 where allowed,
+                # -inf where masked.
+                attn_mask = torch.zeros(T, T, dtype=q.dtype, device=x.device)
+                attn_mask = attn_mask.masked_fill(~allowed, float("-inf"))
+                out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
+                )  # (B, H, T, d_k)
+            else:
+                out = F.scaled_dot_product_attention(
+                    q, k, v, dropout_p=dropout_p, is_causal=True,
+                )  # (B, H, T, d_k)
             new_kv_cache = None
         else:
             # --- Streaming inference: KV cache ---
@@ -308,10 +343,14 @@ class ConformerBlock(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int,
                  conv_kernel: int = 63, dropout: float = 0.1,
-                 max_seq_len: int = 4096):
+                 max_seq_len: int = 4096,
+                 attention_window: Optional[int] = None):
         super().__init__()
         self.ff1 = FeedForwardModule(d_model, d_ff, dropout)
-        self.mha = ConformerMHA(d_model, n_heads, dropout, max_seq_len)
+        self.mha = ConformerMHA(
+            d_model, n_heads, dropout, max_seq_len,
+            attention_window=attention_window,
+        )
         self.conv = ConvolutionModule(d_model, conv_kernel, dropout)
         self.ff2 = FeedForwardModule(d_model, d_ff, dropout)
         self.final_norm = nn.LayerNorm(d_model)
@@ -392,6 +431,7 @@ class ConformerEncoder(nn.Module):
                 conv_kernel=config.conv_kernel,
                 dropout=config.dropout,
                 max_seq_len=config.max_seq_len,
+                attention_window=config.max_cache_len,
             )
             for _ in range(config.n_layers)
         ])

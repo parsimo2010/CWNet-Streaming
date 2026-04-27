@@ -428,7 +428,7 @@ class CWFormerStreamingONNX:
         model_path: str,
         config_path: Optional[str] = None,
         chunk_ms: int = 500,
-        max_cache_sec: float = 30.0,
+        max_cache_sec: float = 5.0,
         blank_trim_sec: float = 5.0,
     ) -> None:
         import onnxruntime as ort
@@ -473,10 +473,12 @@ class CWFormerStreamingONNX:
         self._stft_buffer: Optional[np.ndarray] = None
         self._audio_buffer = np.zeros(0, dtype=np.float32)
         self._all_log_probs: List[np.ndarray] = []
-        self._greedy_argmax: List[int] = []
-        self._silence_reset_armed = True
         self._emitted_text = ""
-        self._committed_text = ""
+        # Silence-reset bookkeeping. ``_total_frames`` is monotonic across
+        # silence-triggered resets so the timer keeps ticking. ``_last_emit_frame``
+        # is None until the first character is emitted (startup grace).
+        self._total_frames = 0
+        self._last_emit_frame: Optional[int] = None
 
     def _init_state(self) -> Dict[str, np.ndarray]:
         """Create zero-initialized state tensors."""
@@ -513,9 +515,9 @@ class CWFormerStreamingONNX:
     def get_full_text(self) -> str:
         """Get all decoded text so far."""
         if not self._all_log_probs:
-            return self._emitted_text
+            return ""
         all_lp = np.concatenate(self._all_log_probs, axis=0)
-        return self._committed_text + greedy_ctc_decode(all_lp)
+        return greedy_ctc_decode(all_lp)
 
     def flush(self) -> str:
         """Process remaining audio. Call at end of stream.
@@ -634,13 +636,19 @@ class CWFormerStreamingONNX:
         if T_out > 0:
             lp = log_probs[:, 0, :]
             self._all_log_probs.append(lp)
-            self._greedy_argmax.extend(np.argmax(lp, axis=-1).tolist())
+            self._total_frames += T_out
 
-            # Decode everything and emit new characters immediately
+            # Decode everything and emit new characters immediately. Log-probs
+            # accumulate across silence-triggered resets — only ONNX state is
+            # reset, not the decoded sequence. CTC greedy is per-frame and
+            # state-independent, so redecoding the full sequence each chunk
+            # gives identical text up to the new suffix.
             all_lp = np.concatenate(self._all_log_probs, axis=0)
-            full_text = self._committed_text + greedy_ctc_decode(all_lp)
+            full_text = greedy_ctc_decode(all_lp)
             new_chars = full_text[len(self._emitted_text):]
             self._emitted_text = full_text
+            if new_chars:
+                self._last_emit_frame = self._total_frames
 
             self._maybe_silence_reset()
             return new_chars
@@ -648,27 +656,33 @@ class CWFormerStreamingONNX:
         return ""
 
     def _maybe_silence_reset(self) -> None:
-        """Flush ONNX streaming state when the trailing argmax window is silent.
+        """Flush ONNX streaming state if no character has been emitted recently.
 
-        Replaces KV caches, conv buffers, sub buffers, and ``pos_offset``
-        with their zero-init values; preserves the mel STFT overlap so the
-        next chunk's spectrogram remains continuous. Each silent stretch
-        fires the reset at most once.
+        Fires when the elapsed time since the last *committed* CTC emission
+        exceeds ``blank_trim_sec``. Replaces KV caches, conv buffers, sub
+        buffers, and ``pos_offset`` with their zero-init values; preserves
+        the mel STFT overlap so the next chunk's spectrogram remains
+        continuous.
+
+        Startup grace: no reset before the first character is emitted,
+        otherwise the empty-cache warmup window (where every frame is
+        argmax-blank) trips the timer and wipes state before the model
+        produces anything. After a fire, the timer restarts at the current
+        frame.
         """
         n = self._blank_trim_frames
-        if n <= 0 or len(self._greedy_argmax) < n:
+        if n <= 0 or self._last_emit_frame is None:
+            return
+        if (self._total_frames - self._last_emit_frame) < n:
             return
 
-        tail = self._greedy_argmax[-n:]
-        all_silent = all(idx == 0 or idx == 1 for idx in tail)
-        if all_silent and self._silence_reset_armed:
-            self._state = self._init_state()
-            self._committed_text = self._emitted_text
-            self._all_log_probs = []
-            self._greedy_argmax = []
-            self._silence_reset_armed = False
-        elif not all_silent:
-            self._silence_reset_armed = True
+        # Reset ONNX state only. Accumulated log-probs and emitted text
+        # are left alone — CTC greedy decode is per-frame and
+        # state-independent, so the prior segment stays correctly decoded
+        # and the next chunk's log-probs (computed from fresh state)
+        # concat cleanly behind it.
+        self._state = self._init_state()
+        self._last_emit_frame = self._total_frames
 
 
 # ---------------------------------------------------------------------------

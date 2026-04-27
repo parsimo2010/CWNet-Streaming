@@ -226,18 +226,27 @@ class MorseConfig:
     # uniform across the sample.
     multi_segment_amplitude_jitter_db: float = 6.0
 
-    # ---- Tier 3: letter-by-letter sender alternation ----
-    # Each letter rendered with independently sampled (pitch, WPM, key,
-    # fist) drawn from a NARROW distribution centred on a session
-    # nominal value. The narrow pitch jitter forces the model to
-    # discriminate letter-by-letter operators by FIST inside the same
-    # mel bin. Use sparingly -- full stage only.
+    # ---- Tier 3: short-burst sender alternation (a.k.a. "fist burst") ----
+    # Each segment is a short multi-character burst from one operator,
+    # rendered with independently sampled (pitch, WPM, key, fist) drawn
+    # from a NARROW distribution centred on a session nominal value.
+    # Narrow pitch jitter forces the model to discriminate operators by
+    # FIST inside the same mel bin. Real-world fist changes inside a
+    # transmission are rarely letter-by-letter; they're typically
+    # multi-character runs (handoffs, brief jump-ins). Burst sizes
+    # default to 1-1 for backward compatibility (= legacy letter
+    # alternation). Bump to 2-5 in the full curriculum to match the
+    # realistic distribution.
     letter_alternation_probability: float = 0.0
     letter_alternation_pitch_jitter_hz: float = 15.0
     letter_alternation_gap_min: float = 0.18
     letter_alternation_gap_max: float = 0.50
     letter_alternation_count_min: int = 8
     letter_alternation_count_max: int = 30
+    # Characters per burst. 1/1 = legacy per-letter alternation;
+    # 2/5 = realistic multi-character bursts.
+    letter_alternation_chars_per_burst_min: int = 1
+    letter_alternation_chars_per_burst_max: int = 1
 
     # Random input gain (dB), applied AFTER peak-normalisation in
     # generate_sample(). Drawn log-uniformly in [lo, hi] dB per sample and
@@ -437,11 +446,15 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.batch_size = 512
         cfg.training.learning_rate = 1e-3
         cfg.training.num_epochs = 300
-        # samples_per_epoch reduced from 75k -> 45k to compensate for
-        # ~1.6x longer average sample duration when multi-segment is
-        # active (40% multi-seg @ avg ~45 s vs single-seg avg ~17 s).
-        # Keeps per-epoch wall-clock similar to single-op-only training.
-        cfg.training.samples_per_epoch = 45000
+        # samples_per_epoch reduced 75k -> 45k -> 36k. The 75 -> 45
+        # accounted for ~1.6x longer avg sample duration when multi-
+        # segment is active (40% multi-seg @ avg ~45 s vs single-seg
+        # avg ~17 s). The 45 -> 36 accounts for the SWA training cost:
+        # the explicit attn_mask blocks the Flash kernel and falls back
+        # to memory-efficient SDPA, which costs ~20% per attention call.
+        # The new letter-alt-at-moderate addition is small (5% prob at
+        # ~22 s avg) and shifts the mean by <1%; no compensation needed.
+        cfg.training.samples_per_epoch = 36000
         cfg.training.val_samples = 5000
         cfg.training.num_workers = 4
         # Real-world augmentations (moderate strength)
@@ -491,8 +504,18 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.multi_segment_probability = 0.40
         cfg.morse.multi_segment_count_min = 1
         cfg.morse.multi_segment_count_max = 3
-        # Letter alternation: full stage only.
-        cfg.morse.letter_alternation_probability = 0.0
+        # Short-burst alternation: enabled at moderate with FIXED 3-char
+        # bursts (3/3) so the model first learns the boundary pattern
+        # without burst-length variability. Full stage widens to 2-5 for
+        # variety. Same gap range as full so the inter-burst silence
+        # distribution stays consistent across stages.
+        cfg.morse.letter_alternation_probability = 0.05
+        cfg.morse.letter_alternation_chars_per_burst_min = 3
+        cfg.morse.letter_alternation_chars_per_burst_max = 3
+        cfg.morse.letter_alternation_gap_min = 0.30
+        cfg.morse.letter_alternation_gap_max = 1.50
+        cfg.morse.letter_alternation_count_min = 4
+        cfg.morse.letter_alternation_count_max = 12
 
     elif scenario == "full":
         cfg.morse.min_snr_db = -5.0
@@ -514,12 +537,16 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.batch_size = 512
         cfg.training.learning_rate = 1e-3
         cfg.training.num_epochs = 500
-        # samples_per_epoch reduced from 50k -> 20k to compensate for
-        # ~2.4x longer average sample duration at full stage (75% multi-
-        # seg @ avg ~50 s vs single-seg avg ~17 s). Each gradient step
-        # now processes ~2.4x more CTC frames, so per-step loss signal
-        # is correspondingly richer.
-        cfg.training.samples_per_epoch = 20000
+        # samples_per_epoch reduced 50k -> 20k -> 16k. The 50 -> 20
+        # accounted for ~2.4x longer avg sample duration at full stage
+        # (75% multi-seg @ avg ~50 s vs single-seg avg ~17 s). The 20
+        # -> 16 accounts for the SWA training cost: explicit attn_mask
+        # blocks the Flash kernel and adds ~20% per attention call,
+        # which compounds at the heaviest stage where multi-segment
+        # samples are longest. The letter-alt change (1-char -> 2-5
+        # char bursts at the same 5% probability) shifts the average
+        # sample duration by <1%; no separate compensation needed.
+        cfg.training.samples_per_epoch = 16000
         cfg.training.val_samples = 5000
         cfg.training.num_workers = 4
         # Real-world augmentations (full strength for curriculum stage 3)
@@ -571,11 +598,21 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.multi_segment_probability = 0.75
         cfg.morse.multi_segment_count_min = 1
         cfg.morse.multi_segment_count_max = 4
-        # Tier 3: letter-by-letter sender alternation. ~5% of multi-
-        # segment samples (i.e. ~3% overall in this stage) become
-        # letter-alternated -- narrow-pitch within a session centre to
-        # force fist-only discrimination inside the same mel bin.
+        # Tier 3: short-burst sender alternation. ~5% of multi-segment
+        # samples (i.e. ~3% overall in this stage) become burst-alternated:
+        # 2-5 chars from one fist, then a short-ish silence (0.3-1.5 s),
+        # then 2-5 chars from another fist, etc. Narrow-pitch around a
+        # session centre forces fist-only discrimination inside the same
+        # mel bin. Replaces the prior per-letter alternation (which was
+        # not realistic for ham radio operating practice).
         cfg.morse.letter_alternation_probability = 0.05
+        cfg.morse.letter_alternation_chars_per_burst_min = 2
+        cfg.morse.letter_alternation_chars_per_burst_max = 5
+        cfg.morse.letter_alternation_gap_min = 0.30
+        cfg.morse.letter_alternation_gap_max = 1.50
+        # With 2-5 chars per burst, fewer bursts fit in the budget.
+        cfg.morse.letter_alternation_count_min = 4
+        cfg.morse.letter_alternation_count_max = 12
 
     else:
         raise ValueError(

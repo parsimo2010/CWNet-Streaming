@@ -72,7 +72,11 @@ def _load_cwformer_checkpoint(
         d_ff=mc.get("d_ff", 1024),
         conv_kernel=mc.get("conv_kernel", 63),
         dropout=0.0,  # no dropout at inference
-        max_cache_len=mc.get("max_cache_len", 1475),
+        # Old checkpoints saved 1475 (the pre-SWA architectural cap).
+        # New checkpoints save 250 (matching the inference-time cache cap
+        # and the training-time sliding-window). Either loads correctly;
+        # the streaming wrapper writes through the runtime override on top.
+        max_cache_len=mc.get("max_cache_len", 250),
     )
     model_cfg = CWFormerConfig(
         mel=mel_cfg, conformer=conformer_cfg,
@@ -148,12 +152,16 @@ class CWFormerStreamingDecoder:
             Larger = slightly better throughput (fewer Python/CUDA overheads).
             Does not affect accuracy (mathematically identical output).
         device: PyTorch device string.
-        max_cache_sec: Maximum KV cache duration in seconds (default 30).
-            Defaults to training's max_audio_sec so relative attention
-            distances stay within the distribution the model actually saw.
-            Extending beyond this relies on RoPE extrapolation, which
-            degrades accuracy on long audio. Set to None to use the cache
-            length stored in the checkpoint config.
+        max_cache_sec: Maximum KV cache duration in seconds (default 5).
+            Empirically, holding more than ~5 s of state across QSO
+            handoffs (fist + pitch + AGC change) causes the model to lock
+            onto the previous operator's tokens and miss the new one. The
+            rolling cache cap forces the prior context to roll off naturally.
+            Training audio went up to 30 s, but multi-segment training
+            already taught the model to function from short segments, so
+            5 s of attention context is plenty for letter-level decoding.
+            Set to None to use the cache length stored in the checkpoint
+            config.
         blank_trim_sec: If the rolling greedy-argmax window of this many
             seconds contains only blank (idx 0) and space (idx 1) frames,
             actively flush the encoder state (KV cache, conv buffers,
@@ -169,7 +177,7 @@ class CWFormerStreamingDecoder:
         checkpoint: str,
         chunk_ms: int = 500,
         device: str = "cpu",
-        max_cache_sec: Optional[float] = 30.0,
+        max_cache_sec: Optional[float] = 5.0,
         blank_trim_sec: Optional[float] = 5.0,
     ) -> None:
         self.device = torch.device(device)
@@ -206,7 +214,7 @@ class CWFormerStreamingDecoder:
         sample_rate: int,
         chunk_ms: int = 500,
         device: Optional[torch.device] = None,
-        max_cache_sec: Optional[float] = 30.0,
+        max_cache_sec: Optional[float] = 5.0,
         blank_trim_sec: Optional[float] = 5.0,
     ) -> "CWFormerStreamingDecoder":
         """Build a decoder around an already-instantiated model.
@@ -250,10 +258,15 @@ class CWFormerStreamingDecoder:
         self._audio_buffer = np.zeros(0, dtype=np.float32)
         self._model_state = self._model.init_streaming_state(self.device)
         self._all_log_probs: list[Tensor] = []
-        self._greedy_argmax: list[int] = []
-        self._silence_reset_armed = True
         self._emitted_text = ""
-        self._committed_text = ""
+        # Silence-reset bookkeeping. ``_total_frames`` is monotonic across
+        # silence-triggered resets so the timer keeps ticking. ``_last_emit_frame``
+        # is None until the first character is emitted (startup grace: never
+        # reset before the model has produced anything, otherwise initial
+        # KV warmup gets nuked the moment the trailing-silence threshold ticks
+        # over).
+        self._total_frames = 0
+        self._last_emit_frame: Optional[int] = None
 
     def feed_audio(self, audio_chunk: np.ndarray) -> str:
         """Feed raw audio samples, return NEW characters decoded since last call.
@@ -280,10 +293,9 @@ class CWFormerStreamingDecoder:
     def get_full_text(self) -> str:
         """Get all decoded text so far."""
         if not self._all_log_probs:
-            return self._emitted_text
-
+            return ""
         all_lp = torch.cat(self._all_log_probs, dim=0)
-        return self._committed_text + self._greedy_decode(all_lp)
+        return self._greedy_decode(all_lp)
 
     def flush(self) -> str:
         """Process any remaining buffered audio. Call at end of stream.
@@ -364,41 +376,56 @@ class CWFormerStreamingDecoder:
         # Accumulate log_probs (T, B, C) -> take batch 0 -> (T, C)
         lp = log_probs[:, 0, :].cpu()
         self._all_log_probs.append(lp)
-        self._greedy_argmax.extend(lp.argmax(dim=-1).tolist())
+        self._total_frames += lp.shape[0]
 
-        # Decode everything and emit new characters
+        # Decode everything and emit new characters. Log-probs accumulate
+        # across silence-triggered resets — only model state is reset, not
+        # the decoded sequence — so redecoding the full accumulated log_probs
+        # each chunk gives identical text up to the new suffix.
         all_lp = torch.cat(self._all_log_probs, dim=0)
-        full_text = self._committed_text + self._greedy_decode(all_lp)
+        full_text = self._greedy_decode(all_lp)
 
         new_chars = full_text[len(self._emitted_text):]
         self._emitted_text = full_text
+        if new_chars:
+            self._last_emit_frame = self._total_frames
 
         self._maybe_silence_reset()
         return new_chars
 
     def _maybe_silence_reset(self) -> None:
-        """Flush encoder state if the trailing window is blank/space only.
+        """Flush encoder state if no character has been emitted recently.
 
-        Mel STFT overlap (``stft_buffer``) is preserved so the spectrogram
-        stays continuous across the reset. Already-emitted text is kept
-        (CTC prefix stability holds even across resets).
+        Fires when the elapsed time since the last *committed* CTC emission
+        exceeds ``blank_trim_sec``. Uses emission gaps instead of per-frame
+        argmax: a real letter occupies only a few of the ~250 trailing frames,
+        so per-frame argmax is mostly blank even mid-decode and was firing
+        spuriously during initial KV warmup. Mel STFT overlap is preserved so
+        the spectrogram stays continuous across the reset; emitted text is
+        kept (CTC prefix stability holds across resets).
+
+        Startup grace: never resets before the first character has been
+        emitted, otherwise the empty-cache warmup window trips the timer.
+        After a fire, the timer restarts at the current frame so the trim
+        cannot re-fire until ``blank_trim_sec`` more elapses without an
+        emission.
         """
         n = self._blank_trim_frames
-        if n <= 0 or len(self._greedy_argmax) < n:
+        if n <= 0 or self._last_emit_frame is None:
+            return
+        if (self._total_frames - self._last_emit_frame) < n:
             return
 
-        tail = self._greedy_argmax[-n:]
-        all_silent = all(idx == 0 or idx == 1 for idx in tail)
-        if all_silent and self._silence_reset_armed:
-            stft_buffer = self._model_state.get('stft_buffer')
-            self._model_state = self._model.init_streaming_state(self.device)
-            self._model_state['stft_buffer'] = stft_buffer
-            self._committed_text = self._emitted_text
-            self._all_log_probs = []
-            self._greedy_argmax = []
-            self._silence_reset_armed = False
-        elif not all_silent:
-            self._silence_reset_armed = True
+        # Reset model state only. The accumulated log-probs and emitted
+        # text are left alone — CTC greedy decode is per-frame and
+        # state-independent, so prior frames stay correctly decoded. The
+        # post-reset chunks will be computed from fresh KV/conv buffers
+        # (good — that's the point), but their per-frame log-probs concat
+        # cleanly with the prior segment.
+        stft_buffer = self._model_state.get('stft_buffer')
+        self._model_state = self._model.init_streaming_state(self.device)
+        self._model_state['stft_buffer'] = stft_buffer
+        self._last_emit_frame = self._total_frames
 
     @staticmethod
     def _greedy_decode(log_probs: Tensor) -> str:

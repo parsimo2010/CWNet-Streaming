@@ -67,7 +67,7 @@ output never changes).
 ### Infrastructure
 - `config.py` — `MorseConfig`, `TrainingConfig`, `create_default_config(scenario)`. **sample_rate = 16000**.
 - `vocab.py` — CTC vocabulary (52 classes). `encode(text)`, `decode(indices)`, `decode_ctc(log_probs)`.
-- `metrics.py` — Shared Levenshtein / CER helpers (`compute_cer`, `levenshtein`, `per_position_errors`). Used by training, benchmarks, and `demo_samples/CER.py`.
+- `metrics.py` — Shared Levenshtein / CER helpers (`compute_cer`, `levenshtein`, `per_position_errors`). Used by training, benchmarks, and `demo_samples/CER.py`. Both ref and hyp are normalised: stripped, upper-cased, with consecutive ASCII spaces collapsed to a single space — multi-segment samples have long inter-segment silences that the model legitimately decodes as runs of multiple spaces, and without collapsing those would all count as insertions.
 - `morse_table.py` — ITU Morse code table + binary trie.
 - `morse_generator.py` — Synthetic training data. `generate_sample(config)` -> `(audio_f32, text, metadata)`. All augmentations: AGC, QSB, QRM, QRN, bandpass, HF noise, key types, timing jitter, speed drift, input-gain.
 - `qso_corpus.py` — `QSOCorpusGenerator` for realistic ham radio QSO text.
@@ -80,7 +80,7 @@ output never changes).
   - `forward_streaming(mel_chunk, state)` — Inference: single chunk with KV cache + conv buffers. Returns `(log_probs, new_state)`.
   - `ConvSubsampling` — Causal 2x time reduction (left-pad=2, right-pad=0 in time for both Conv2d layers). Streaming uses variable-length (1 or 2 frames) conv1 carry-over to stay aligned across chunks with odd padded length.
 - `conformer.py` — Causal Conformer blocks.
-  - `ConformerMHA` — Causal self-attention. Training: `is_causal=True` in SDPA. Inference: KV cache concatenation + causal mask within chunk. RoPE with position offset. RoPE tables auto-extend on demand for long sessions.
+  - `ConformerMHA` — Sliding-window causal self-attention. Training: explicit causal-window mask sized at `attention_window = config.max_cache_len` (default 250 frames = 5 s @ 50 fps); falls through to `is_causal=True` (Flash kernel) when the window covers the full sequence. Inference: KV cache concatenation + explicit causal mask within chunk; cache trimmed to `max_cache_len` between chunks. Train and inference use the same window so per-frame outputs match (modulo small chunk-boundary noise — late queries in a chunk briefly see up to `chunk_size` extra keys before the next trim). RoPE with position offset; RoPE tables auto-extend on demand for long sessions.
   - `ConvolutionModule` — Causal depthwise conv, left-pad only. `nn.LayerNorm` after the depthwise conv (per-frame statistics independent of batch composition and sequence length, matching streaming inference). Inference: conv buffer carry-forward of (kernel-1)=62 frames.
   - `ConformerEncoder` — Threads KV caches and conv buffers through 12 blocks. No padding mask: causality prevents valid frames from attending to padded positions, and LayerNorm is per-frame throughout.
 - `rope.py` — Rotary Position Embeddings with `offset` parameter for KV cache positions. `_build_tables()` auto-extends the cos/sin table when a streaming session grows longer than the initial `max_len` (4096 default).
@@ -91,7 +91,7 @@ output never changes).
 - `train_cwformer.py` — Training loop. Micro-batch 8, effective batch 64 via gradient accumulation. Causal attention active during training. Supports optional streaming-mode validation and auto-curriculum progression (clean -> moderate -> full on CER plateau).
 
 #### Inference
-- `inference_cwformer.py` — `CWFormerStreamingDecoder`: chunk-based streaming with state carry-forward. No windows, no stitching. No commitment delay — emits characters as soon as greedy CTC decodes them (causal prefix stability). Methods: `feed_audio()`, `get_full_text()`, `flush()`, `decode_file()`, `decode_audio()`. `decode_audio()` peak-normalizes audio to 0.7 on entry to match the training distribution; `feed_audio()` does not normalize (caller owns live-audio gain). `max_cache_sec` caps the KV cache to the training-audio max (30 s by default).
+- `inference_cwformer.py` — `CWFormerStreamingDecoder`: chunk-based streaming with state carry-forward. No windows, no stitching. No commitment delay — emits characters as soon as greedy CTC decodes them (causal prefix stability). Methods: `feed_audio()`, `get_full_text()`, `flush()`, `decode_file()`, `decode_audio()`. `decode_audio()` peak-normalizes audio to 0.7 on entry to match the training distribution; `feed_audio()` does not normalize (caller owns live-audio gain). `max_cache_sec` caps the KV cache (default 5 s; empirically the inflection point — beyond ~5 s the model locks onto a previous operator's tokens through QSO handoffs and misses the new one).
 
 ### Deployment
 - `quantize_cwformer.py` — Streaming ONNX export with state I/O (KV caches + conv buffers as explicit input/output tensors). INT8 dynamic quantization. Also saves `mel_basis.npy` and `mel_window.npy` bit-for-bit so deployment uses the exact tables the model was trained with.
@@ -145,13 +145,20 @@ silences are sampled independently from an exponential (mean ~2 s,
 clipped to 0–10 s); inter-segment gaps are short-biased (60% under
 1.5 s) with a long tail up to 15 s, clipped to remaining budget.
 The randomized layout removes positional bias in boundary times.
-**Run moderate/full with `--max-audio-sec 30`** — the model's
-`max_cache_sec` is 30 s, so longer audio doesn't help.
+**Run moderate/full with `--max-audio-sec 30`** — training audio
+goes up to 30 s. Note: inference `max_cache_sec` is 5 s by default
+(see Inference section); training still uses full sequences.
 
-**Letter alternation** (Tier 3, full only): 5% of multi-segment samples
-render each letter as a separate "operator" with ±15 Hz pitch jitter
-around a session centre and 0.18–0.5 s inter-letter gaps. Forces
-letter-by-letter fist discrimination inside the same mel bin.
+**Short-burst alternation** (Tier 3, full only, formerly "letter
+alternation"): 5% of multi-segment samples render the audio as a chain
+of short multi-character bursts (default 2–5 chars per burst) from
+independently-sampled operators, narrow ±15 Hz pitch jitter around a
+session centre, with 0.3–1.5 s "short-ish silence" gaps between bursts.
+Forces fist discrimination at burst boundaries inside the same mel bin
+without the unrealistic letter-by-letter alternation that the original
+Tier 3 used. Configurable via `letter_alternation_chars_per_burst_min/
+max` (defaults 1/1 for backwards compatibility; full curriculum bumps
+to 2/5).
 
 ---
 
@@ -169,7 +176,9 @@ letter-by-letter fist discrimination inside the same mel bin.
 2. **2x subsampling gives 50 fps (20 ms per CTC frame)** — resolves dits up to 40+ WPM.
 3. **Causal attention** — `is_causal=True` during training, KV cache + causal mask during inference. Never let a frame see future audio.
 4. **Causal convolution** — left-pad only. Per-block receptive field = kernel × frame stride = 63 × 20 ms = 1240 ms. Inference maintains a (kernel-1)=62-frame conv buffer per layer.
-5. **KV cache** — grows per chunk during inference. Trimmed to `max_cache_len` (1475 frames, ≈ 29.5 s; leaves 25-frame chunk headroom vs the 1500-frame training max so the post-concat attention window stays ≤ training max). Position offset tracks absolute position for RoPE; RoPE tables auto-extend if the session runs long.
+5. **KV cache / sliding-window attention** — `ConformerConfig.max_cache_len` (default 250 frames = 5 s at 50 fps) controls both: (a) the training-time sliding-window causal mask in `ConformerMHA`, and (b) the inference-time KV cache trim between chunks in `CWFormer.forward_streaming`. Same value used in both paths so the model trains for the exact compute graph it deploys against. Position offset tracks absolute position for RoPE; RoPE tables auto-extend if the session runs long. Old checkpoints saved `max_cache_len=1475` (the pre-SWA architectural cap); they still load — the `attention_window < T-1` check in `ConformerMHA` simply falls through to `is_causal=True` for any reasonable training sequence.
+
+   **Known minor train↔inference discrepancy (deferred fix):** training's SWA mask gives every query exactly `max_cache_len + 1` keys; inference's mask is just causal over the concatenated `cache || new_chunk` buffer. So a query late in a chunk sees up to `chunk_size − 1` extra keys at the *oldest* end of the cache (frames training would have rolled out). Bound: ~24 extra keys for 500 ms chunks — about 10 % more keys than training, and the extra keys are the most distant in time (lowest expected attention weight). The fix is a 1-line tightening of the inference mask in `ConformerMHA.forward`'s streaming branch — change `attn_mask = delta > T_cached_t` to `attn_mask = (delta > T_cached_t) | (delta < T_cached_t - window)`. **No retrain required** (weights are agnostic to the mask shape). Defer until after the next training run; if streaming-vs-full-forward CER on the held-out real-world set shows a measurable gap, apply the tweak then.
 6. **No commitment delay** — causal CTC's prefix-stability guarantees the emitted text never changes as more audio arrives, so characters emit as soon as greedy decode stabilizes. Don't reintroduce a delay without a specific reason.
 7. **Boundary space tokens** — dataset wraps targets with `[space] + encode(text) + [space]`.
 8. **Persistent worker RNG** — use `np.random.default_rng()` (OS entropy), not `worker_info.seed`.

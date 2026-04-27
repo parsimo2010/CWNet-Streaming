@@ -1148,6 +1148,8 @@ def _compose_multi_segment(
             config.letter_alternation_count_min,
             config.letter_alternation_count_max + 1,
         ))
+        burst_lo = max(1, int(config.letter_alternation_chars_per_burst_min))
+        burst_hi = max(burst_lo, int(config.letter_alternation_chars_per_burst_max))
         gap_lo = config.letter_alternation_gap_min
         gap_hi = config.letter_alternation_gap_max
         gaps = [float(rng.uniform(gap_lo, gap_hi))
@@ -1159,21 +1161,28 @@ def _compose_multi_segment(
 
         leading_sec = float(rng.uniform(0.5, 1.5))
         trailing_sec = float(rng.uniform(0.5, 1.5))
+        # Each burst's audio is roughly burst_chars * 60 / (5 * wpm).
+        # Use the lowest WPM as a worst-case estimate so a slow operator
+        # in the burst doesn't blow the budget.
+        worst_wpm = max(1.0, float(config.min_wpm))
+        avg_burst_chars = 0.5 * (burst_lo + burst_hi)
+        per_burst_sec_est = (avg_burst_chars * 60.0) / (5.0 * worst_wpm)
+        min_per_seg = max(1.5, per_burst_sec_est)
         silence_total = leading_sec + trailing_sec + sum(gaps)
         seg_budget = max_duration_sec - silence_total
-        if seg_budget < 1.5 * n_segments:
+        if seg_budget < min_per_seg * n_segments:
             gap_total = sum(gaps)
             if gap_total > 0:
                 shrink = max(
                     0.0,
                     (max_duration_sec - leading_sec - trailing_sec
-                     - 1.5 * n_segments) / gap_total
+                     - min_per_seg * n_segments) / gap_total
                 )
                 gaps = [g * shrink for g in gaps]
                 silence_total = leading_sec + trailing_sec + sum(gaps)
                 seg_budget = max_duration_sec - silence_total
-            if seg_budget < 1.5 * n_segments:
-                n_segments = max(1, int(seg_budget / 1.5))
+            if seg_budget < min_per_seg * n_segments:
+                n_segments = max(1, int(seg_budget / min_per_seg))
                 gaps = gaps[:max(0, n_segments - 1)]
 
         seg_specs: List[Dict] = []
@@ -1193,7 +1202,11 @@ def _compose_multi_segment(
                 ))
             amp_offset_db = float(rng.uniform(-amp_jitter_db, 0.0))
             amplitude = base_amp * (10.0 ** (amp_offset_db / 20.0))
-            text = chr(int(rng.integers(ord("A"), ord("Z") + 1)))
+            burst_chars = int(rng.integers(burst_lo, burst_hi + 1))
+            text = "".join(
+                chr(int(rng.integers(ord("A"), ord("Z") + 1)))
+                for _ in range(burst_chars)
+            )
             seg_specs.append({
                 "text": text, "wpm": wpm, "base_freq": base_freq,
                 "key_type": key_type, "amplitude": amplitude,
